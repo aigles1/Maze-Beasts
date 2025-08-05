@@ -1,5 +1,5 @@
 # Maze-Beasts
-A first-person shooter random maze game that runs on the pygame engine. Made with Grok 4.<br/><br/>
+A first-person shooter random maze game using the pygame library. Made with Grok 4.<br/><br/>
 Controls:<br/>
 WASD to move.<br/>
 Left click to shoot.<br/>
