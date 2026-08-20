@@ -7,5 +7,5 @@ Hold Tab to view entire maze.<br/>
 F8 to generate a new random maze.<br/>
 ESC to exit game.<br/>
 <br/>
-Update 8/17/2025<br/>
-Currently working on a C++ version of this game with the wall stretching issue fixed.
+Update 8/20/2026<br/>
+I made a working C++ version of this game with the wall stretching issue fixed, but will not release it until the game is more finished.
