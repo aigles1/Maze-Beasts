@@ -30,13 +30,13 @@ Tested on Windows 11. No Visual C++ Redistributable or other installs are needed
 
 ## Building from source
 
-1. Open `MazeGameFromScratch11.sln` in Visual Studio 2026 (platform toolset v145).
+1. Open `MazeBeasts.sln` in Visual Studio 2026 (platform toolset v145).
 2. Build the **Release | x64** configuration.
 3. Pack the assets:
    ```
    powershell -ExecutionPolicy Bypass -File tools\packassets.ps1
    ```
-4. Put `x64\Release\MazeGameFromScratch11.exe` and `MazeGameFromScratch11\assets.dat` in the same folder and run the exe.
+4. Put `x64\Release\MazeBeasts.exe` and `MazeBeasts\assets.dat` in the same folder and run the exe.
 
 When run from Visual Studio, the game falls back to the loose asset files in the project folder, so step 3 is only needed for a standalone copy.
 
@@ -50,7 +50,7 @@ Maze-Beasts is licensed under the GNU General Public License v3.0. See [LICENSE]
 
 It includes third-party components under their own licenses:
 
-- [Liberation Sans](https://github.com/liberationfonts/liberation-fonts) font: SIL Open Font License 1.1 (see `MazeGameFromScratch11/LiberationSans-LICENSE.txt`)
+- [Liberation Sans](https://github.com/liberationfonts/liberation-fonts) font: SIL Open Font License 1.1 (see `MazeBeasts/LiberationSans-LICENSE.txt`)
 - [GLFW](https://www.glfw.org/): zlib/libpng License
 - [GLM](https://github.com/g-truc/glm): MIT License
 - [glad](https://github.com/Dav1dde/glad): generated OpenGL loader

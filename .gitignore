@@ -6,30 +6,30 @@
 !.gitignore
 !README.md
 !LICENSE
-!MazeGameFromScratch11.sln
+!MazeBeasts.sln
 !tools/packassets.ps1
 
 # Project and source
-!MazeGameFromScratch11/MazeGameFromScratch11.vcxproj
-!MazeGameFromScratch11/MazeGameFromScratch11.vcxproj.filters
-!MazeGameFromScratch11/MazeGameFromScratch11.vcxproj.user
-!MazeGameFromScratch11/mazebeasts.cpp
-!MazeGameFromScratch11/glad.c
+!MazeBeasts/MazeBeasts.vcxproj
+!MazeBeasts/MazeBeasts.vcxproj.filters
+!MazeBeasts/MazeBeasts.vcxproj.user
+!MazeBeasts/mazebeasts.cpp
+!MazeBeasts/glad.c
 
 # Third-party headers and the GLFW static libraries (Debug links glfw3.lib, Release glfw3_mt.lib)
-!MazeGameFromScratch11/include/**
-!MazeGameFromScratch11/lib-vc2022/glfw3.lib
-!MazeGameFromScratch11/lib-vc2022/glfw3_mt.lib
+!MazeBeasts/include/**
+!MazeBeasts/lib-vc2022/glfw3.lib
+!MazeBeasts/lib-vc2022/glfw3_mt.lib
 
 # Game assets (packed into assets.dat by tools/packassets.ps1)
-!MazeGameFromScratch11/LiberationSans-Regular.ttf
-!MazeGameFromScratch11/LiberationSans-LICENSE.txt
-!MazeGameFromScratch11/wall_texture.png
-!MazeGameFromScratch11/boundary_texture.png
-!MazeGameFromScratch11/monster_texture.png
-!MazeGameFromScratch11/monster2_texture.png
-!MazeGameFromScratch11/medpack.png
-!MazeGameFromScratch11/cavewalltexture.jpg
-!MazeGameFromScratch11/cavefloorgrok.jpg
-!MazeGameFromScratch11/monster_sound.flac
-!MazeGameFromScratch11/boss_sound.flac
+!MazeBeasts/LiberationSans-Regular.ttf
+!MazeBeasts/LiberationSans-LICENSE.txt
+!MazeBeasts/wall_texture.png
+!MazeBeasts/boundary_texture.png
+!MazeBeasts/monster_texture.png
+!MazeBeasts/monster2_texture.png
+!MazeBeasts/medpack.png
+!MazeBeasts/cavewalltexture.jpg
+!MazeBeasts/cavefloorgrok.jpg
+!MazeBeasts/monster_sound.flac
+!MazeBeasts/boss_sound.flac

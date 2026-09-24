@@ -7,7 +7,7 @@
 #          per entry:  uint16 nameLen, name bytes (UTF-8), uint64 offset, uint64 size
 #          then the raw file blobs, in entry order.
 param(
-    [string]$ProjectDir = (Join-Path $PSScriptRoot '..\MazeGameFromScratch11'),
+    [string]$ProjectDir = (Join-Path $PSScriptRoot '..\MazeBeasts'),
     [string]$OutFile    = ''
 )
 $ProjectDir = (Resolve-Path $ProjectDir).Path

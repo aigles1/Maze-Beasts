@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.14.36401.2
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MazeGameFromScratch11", "MazeGameFromScratch11\MazeGameFromScratch11.vcxproj", "{6CDB2CCE-006E-4AE9-862F-66C4497BD9BE}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MazeBeasts", "MazeBeasts\MazeBeasts.vcxproj", "{6CDB2CCE-006E-4AE9-862F-66C4497BD9BE}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
