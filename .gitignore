@@ -1,0 +1,35 @@
+# Allowlist: ignore everything, then opt back in to exactly what belongs in the repo.
+# This keeps build output, Visual Studio caches and unused local files out by default.
+*
+!*/
+
+!.gitignore
+!README.md
+!LICENSE
+!MazeGameFromScratch11.sln
+!tools/packassets.ps1
+
+# Project and source
+!MazeGameFromScratch11/MazeGameFromScratch11.vcxproj
+!MazeGameFromScratch11/MazeGameFromScratch11.vcxproj.filters
+!MazeGameFromScratch11/MazeGameFromScratch11.vcxproj.user
+!MazeGameFromScratch11/mazebeasts.cpp
+!MazeGameFromScratch11/glad.c
+
+# Third-party headers and the GLFW static libraries (Debug links glfw3.lib, Release glfw3_mt.lib)
+!MazeGameFromScratch11/include/**
+!MazeGameFromScratch11/lib-vc2022/glfw3.lib
+!MazeGameFromScratch11/lib-vc2022/glfw3_mt.lib
+
+# Game assets (packed into assets.dat by tools/packassets.ps1)
+!MazeGameFromScratch11/LiberationSans-Regular.ttf
+!MazeGameFromScratch11/LiberationSans-LICENSE.txt
+!MazeGameFromScratch11/wall_texture.png
+!MazeGameFromScratch11/boundary_texture.png
+!MazeGameFromScratch11/monster_texture.png
+!MazeGameFromScratch11/monster2_texture.png
+!MazeGameFromScratch11/medpack.png
+!MazeGameFromScratch11/cavewalltexture.jpg
+!MazeGameFromScratch11/cavefloorgrok.jpg
+!MazeGameFromScratch11/monster_sound.flac
+!MazeGameFromScratch11/boss_sound.flac
