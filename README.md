@@ -1,6 +1,6 @@
 # Maze-Beasts
 
-A first-person random maze shooter written in C++ with OpenGL.
+A first-person procedural maze shooter written in C++ with OpenGL.
 
 ## Objective
 
