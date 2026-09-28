@@ -102,4 +102,4 @@ If a game says *Could not reach ...*, check that the server is running, that the
 
 ## Windows
 
-The release also includes `MazeBeastsServer.exe`, the same server for Windows (for example, on a LAN). Run it from a console, or double-click it. `Test dedicated server on this PC.bat` starts it together with two game windows already joined to it. The first time, Windows Firewall may ask whether to allow it on your network.
+The release also includes `MazeBeastsServer.exe`, the same server for Windows (for example, on a LAN). Run it from a console, or double-click it. To try it on one PC, start two games that join it: `MazeBeasts.exe --windowed=left --join=127.0.0.1` and `MazeBeasts.exe --windowed=right --join=127.0.0.1`. The first time, Windows Firewall may ask whether to allow it on your network.

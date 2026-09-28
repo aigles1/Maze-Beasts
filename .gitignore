@@ -7,6 +7,8 @@
 !.gitattributes
 !README.md
 !LICENSE
+!VERSION
+!.github/workflows/*.yml
 !MazeBeasts.sln
 !tools/packassets.ps1
 !tools/make-server-bundle.ps1

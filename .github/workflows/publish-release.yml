@@ -1,0 +1,38 @@
+# Publishes a release when its code reaches main.
+#
+# Each release is prepared ahead of time as a draft on GitHub, named after the version in the
+# VERSION file (for example v0.42), with the Windows build and the Linux server source attached.
+# When the pull request carrying that version is merged, this publishes the draft: GitHub
+# creates the tag on the merge commit and the release becomes the latest one. Pushes to main
+# that don't change the version find no draft and do nothing.
+name: Publish release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish the draft release for this version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          tag="v$version"
+          state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || true)"
+          if [ "$state" = "true" ]; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --target "$GITHUB_SHA" --latest
+            echo "Published $tag at $GITHUB_SHA."
+          elif [ "$state" = "false" ]; then
+            echo "$tag is already published; nothing to do."
+          else
+            echo "No draft release for $tag; nothing to publish."
+          fi
