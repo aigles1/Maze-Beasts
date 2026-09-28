@@ -4,10 +4,12 @@
 !*/
 
 !.gitignore
+!.gitattributes
 !README.md
 !LICENSE
 !MazeBeasts.sln
 !tools/packassets.ps1
+!tools/make-server-bundle.ps1
 
 # Project and source
 !MazeBeasts/MazeBeasts.vcxproj
@@ -17,6 +19,16 @@
 !MazeBeasts/glad.c
 !MazeBeasts/net.h
 !MazeBeasts/net.cpp
+!MazeBeasts/protocol.h
+!MazeBeasts/world.h
+!MazeBeasts/world.cpp
+
+# Dedicated server (shares the files above; builds with Visual Studio or, on Linux, make)
+!MazeBeastsServer/server.cpp
+!MazeBeastsServer/Makefile
+!MazeBeastsServer/README.md
+!MazeBeastsServer/MazeBeastsServer.vcxproj
+!MazeBeastsServer/MazeBeastsServer.vcxproj.filters
 
 # ENet (reliable UDP for multiplayer), vendored source - see MazeBeasts/enet/VERSION.txt
 !MazeBeasts/enet/**

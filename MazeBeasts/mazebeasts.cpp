@@ -20,6 +20,8 @@
 #include <filesystem>
 
 #include "net.h" // multiplayer; kept free of winsock so it can't clash with miniaudio's <windows.h>
+#include "protocol.h"
+#include "world.h" // the maze itself, shared with the dedicated server
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -192,23 +194,6 @@ static ma_result pack_vfs_info(ma_vfs* vfs, ma_vfs_file file, ma_file_info* info
     return MA_SUCCESS;
 }
 
-struct Monster {
-    double x, y;
-    int hp;
-    int type;
-    double target_x, target_y;
-    int cooldown;
-    int hit_flash = 0; // frames remaining to render this monster tinted red after being hit
-    int id = 0;        // stable across the network: assigned in spawn order, identical everywhere
-    double net_x = 0.0, net_y = 0.0; // latest networked position, which x/y glide toward
-};
-
-struct HealthPack {
-    double x, y;
-    int level = 0; // 0 = maze, 1 = lower level; both share the same x/y footprint
-    int id = 0;    // stable across the network, so a pickup names the right pack
-};
-
 // Medpacks sit on the floor and are small enough to step around. The pickup radius is what
 // makes that possible: packs spawn 0.2-0.8 across a cell and the player can get to within
 // 0.06 of a wall, so even a pack dead-centre in a one-tile corridor leaves 0.22 of clearance.
@@ -227,17 +212,6 @@ static float transparent_bottom_margin(const unsigned char* data, int w, int h, 
     }
     return 0.0f;
 }
-
-struct Projectile {
-    double x, y;
-    double dir_x, dir_y;
-    double speed;
-    double z = 0.5;      // world height (upper level spans 0..1, lower level spans -2..0)
-    double dir_z = 0.0;  // vertical component of travel direction
-    bool from_boss = false; // boss shots hit harder and render smaller
-    int level = 0;       // which level's walls this shot collides with (0 = maze, 1 = lower)
-    int owner = 0;       // who fired it: 0 = a monster, 1-3 = that player's slot
-};
 
 // Command-line switches. The multiplayer ones exist mainly so two or three copies can be
 // launched side by side and wired together without clicking through the menus.
@@ -266,30 +240,18 @@ struct Sprite {
     double dist;
 };
 
-class MazeGame {
+// The game: the maze and its monsters (World, shared with the dedicated server) plus you, the
+// window, the pictures, the sound and the network.
+class MazeGame : private World {
 private:
-    int grid_size = 33;
-    std::vector<std::vector<int>> grid;
-    std::map<std::pair<int, int>, std::set<std::pair<int, int>>> connections;
-    std::pair<int, int> start, end;
-    std::vector<std::tuple<int, int, int>> rooms;
     double player_pos_x, player_pos_y;
     double dir_x, dir_y;
-    std::vector<Monster> monsters;
-    std::vector<HealthPack> health_packs;
     std::vector<Projectile> projectiles;
     std::vector<Projectile> monster_projectiles;
     int max_hp = 20;            // boss shots deal 4-5, so it takes 4-5 of them to kill
     int player_hp = max_hp;
     int damage_cooldown = 0;
     double min_dist = 0.06; // get right up to a wall, but a hair in front so you can't see past it
-
-    // Lower level: a wide-open floor beneath the maze, reached by a staircase near the start.
-    // It shares the maze's grid footprint, so (x, y) coordinates carry across both levels.
-    static constexpr double lower_floor_y = -2.0; // world height of the lower floor
-    std::vector<std::vector<int>> lower_grid;
-    std::map<std::pair<int, int>, std::set<std::pair<int, int>>> lower_connections;
-    std::vector<std::pair<int, int>> stair_cells; // the staircase run, ordered top to bottom
     int player_level = 0; // 0 = maze, 1 = lower level
 
     // Jumping (spacebar): height above whatever floor is under the player, and vertical speed.
@@ -373,7 +335,6 @@ private:
     bool f6_pressed = false;  // previous F6 key state
     bool f7_pressed = false;  // previous F7 key state
     size_t dev_tp_index = 0;  // which boss room the next F6 teleport targets
-    std::mt19937 rng;
     double win_timer = 0.0;
     bool showing_win = false;
     double die_timer = 0.0;
@@ -394,44 +355,13 @@ private:
     bool boss_sound_active = false;
 
     // --- Multiplayer -----------------------------------------------------------------------
-    // One machine hosts; the others connect to it directly by IP. The host is the authority on
-    // monsters, bosses, medpacks and when a round ends, and relays every player's messages to
-    // the rest. Each player is the authority on their own movement and health: the shooter's
-    // machine decides damage to monsters, and a victim's machine decides damage to itself.
-    //
-    // Slots: 1 = the host, who starts where singleplayer does; 2 = starts at the exit and must
-    // escape through Player 1's start; 3 = optional, controls one of the bosses ("the Beast").
-    //
-    // Every message starts with its type byte. Gameplay messages then carry the round number,
-    // so anything still in flight from a previous maze is recognised and ignored.
-    enum Msg : uint8_t {
-        MSG_HELLO = 1,    // C->H  u8 protocol version
-        MSG_WELCOME,      // H->C  u8 slot, u32 seed
-        MSG_REJECT,       // H->C  u8 reason
-        MSG_LOBBY,        // H->C  u8 bit mask of occupied slots
-        MSG_ASSIGN,       // H->C  u8 new slot (the Beast moves up if Player 2 leaves the lobby)
-        MSG_START,        // H->C  u8 round, u32 seed, i32 Beast's boss id, u8 slot mask
-        MSG_STATE,        // any   u8 round, u8 slot, u8 level, u8 flags, f32 x y jump yaw pitch, i16 hp
-        MSG_SHOT,         // any   u8 round, u8 owner, u8 level, u8 boss shot, f32 x y z dx dy dz speed
-        MSG_MONSTERS,     // H->C  u8 round, u16 count, count x {i32 id, f32 x y, i32 hp, u8 type, u8 flash}
-        MSG_MONSTER_HIT,  // C->H  u8 round, i32 monster id, i32 damage
-        MSG_DEATH,        // any   u8 round, u8 victim, u8 killer (0 = a monster)
-        MSG_PICKUP,       // C->H  u8 round, i32 medpack id
-        MSG_PACK_GONE,    // H->C  u8 round, i32 medpack id
-        MSG_REACHED_EXIT, // C->H  u8 round, u8 slot
-        MSG_ROUND_OVER,   // H->C  u8 round, u8 winner
-        MSG_BEAST_BOSS,   // H->C  u8 round, i32 boss id the Beast now controls (-1 = none left)
-    };
-    static constexpr uint8_t PROTOCOL_VERSION = 1;
-    enum RejectReason : uint8_t { REJECT_IN_PROGRESS = 1, REJECT_VERSION = 2, REJECT_FULL = 3 };
-
-    static constexpr double STATE_INTERVAL      = 1.0 / 30.0; // own position, 30 times a second
-    static constexpr double MONSTER_INTERVAL    = 1.0 / 20.0; // host's monster snapshot
+    // See protocol.h for how the game is shared out. Here the authority is either this copy
+    // (Mode::Host, a player hosting from the menu) or the machine it joined (Mode::Client),
+    // which may be another player's copy or a dedicated server.
     static constexpr int    PVP_DAMAGE          = 5;          // 4 hits down a full-health player
     static constexpr double BEAST_SPEED         = 0.85;       // times a player's speed
     static constexpr double BEAST_FIRE_INTERVAL = 0.6;        // seconds between the Beast's shots
     static constexpr int    BEAST_MAX_HP        = 440;        // top of the boss health range
-    static constexpr double ROUND_OVER_SECONDS  = 5.0;        // winner banner before the next maze
     static constexpr double RESPAWN_SECONDS     = 5.0;        // spectating after a death in multiplayer
     // Other players are a 3D soldier 0.6 tall (see build_player_model). The hit cylinder hugs
     // that figure; it was 0.22 wide for the old flat sprite, which spread its arms and gun out.
@@ -440,7 +370,8 @@ private:
 
     enum class Mode { Single, Host, Client };
     enum class Screen { None, Main, Host, Join, Sound };
-    enum class MenuAction { None, Single, Join, Host, Sound, Exit, StartGame, CancelHost, Connect, BackFromJoin, BackFromSound, TestSound };
+    enum class MenuAction { None, Single, Join, Host, Sound, Exit, StartGame, CancelHost, Connect, BackFromJoin, BackFromSound,
+                            TestSound, RequestStart };
 
     struct RemotePlayer {
         bool present = false;    // in this game (lobby or round)
@@ -507,7 +438,12 @@ private:
     std::string join_address = "127.0.0.1";
     uint16_t join_port = net::DEFAULT_PORT;
     bool join_connecting = false, join_connected = false;
+    bool server_dedicated = false;   // joined a dedicated server rather than a player's game
+    bool joined_in_progress = false; // joined while a maze was under way: playing from the next one
+    bool mp_maze = false;            // the maze on screen is a shared one (swapped for a fresh one on leaving)
     int menu_focus = 0;
+    Screen focus_screen = Screen::None;   // for spotting the first button becoming available
+    bool first_was_enabled = false;
     double menu_last_mx = -1.0, menu_last_my = -1.0;
     bool esc_pressed = false, f8_pressed = false, click_prev = false;
     bool up_prev = false, down_prev = false, enter_prev = false;
@@ -521,8 +457,7 @@ private:
     bool slider_dragging = false;
 
 public:
-    MazeGame(const LaunchOptions& options) : opts(options), rng(static_cast<std::mt19937::result_type>(
-        std::chrono::steady_clock::now().time_since_epoch().count())) {
+    MazeGame(const LaunchOptions& options) : opts(options) {
         // Load the bundle first: textures, the font and audio all read through it.
         // Without it every lookup falls back to loose files, so a dev checkout still runs.
         if (assets.load("assets.dat"))
@@ -679,62 +614,13 @@ public:
         return type == 2 ? boss_bottom_margin : monster_bottom_margin;
     }
 
-    bool room_has_boss(int room_idx) {
-        int rx, ry, rs;
-        std::tie(rx, ry, rs) = rooms[room_idx];
-        for (const auto& m : monsters) {
-            if (m.type == 2 && m.x >= rx && m.x < rx + rs && m.y >= ry && m.y < ry + rs) return true;
-        }
-        return false;
-    }
-
     // --- Level plumbing -------------------------------------------------------------------
     // Both levels share the same coordinate space, so collision, line of sight and the map
-    // all just need to be told which level's grid to consult.
-
-    const std::vector<std::vector<int>>& grid_for(int level) const {
-        return level == 0 ? grid : lower_grid;
-    }
-
-    std::map<std::pair<int, int>, std::set<std::pair<int, int>>>& conn_for(int level) {
-        return level == 0 ? connections : lower_connections;
-    }
-
-    static void link(std::map<std::pair<int, int>, std::set<std::pair<int, int>>>& conn,
-                     std::pair<int, int> a, std::pair<int, int> b) {
-        conn[a].insert(b);
-        conn[b].insert(a);
-    }
-
-    static void unlink(std::map<std::pair<int, int>, std::set<std::pair<int, int>>>& conn,
-                       std::pair<int, int> a, std::pair<int, int> b) {
-        conn[a].erase(b);
-        conn[b].erase(a);
-    }
-
-    bool is_stair_cell(int x, int y) const {
-        for (const auto& c : stair_cells) if (c.first == x && c.second == y) return true;
-        return false;
-    }
-
-    // How far along the staircase a position is: 0 at the top step, 1 at the bottom.
-    // The run is laid out along +x, so only the x coordinate matters.
-    double stair_progress(double x) const {
-        if (stair_cells.empty()) return 0.0;
-        double t = (x - stair_cells.front().first) / static_cast<double>(stair_cells.size());
-        return std::clamp(t, 0.0, 1.0);
-    }
+    // all just need to be told which level's grid to consult (see World).
 
     // World height of the surface under a position. On the staircase this ramps smoothly
     // between the two floors; everywhere else it is whichever floor the player is on.
     double floor_y_at(double x, double y) const { return floor_height(x, y, player_level); }
-
-    // Same, for anyone on a given level (other players carry their own level).
-    double floor_height(double x, double y, int level) const {
-        if (is_stair_cell(static_cast<int>(x), static_cast<int>(y)))
-            return stair_progress(x) * lower_floor_y;
-        return level == 0 ? 0.0 : lower_floor_y;
-    }
 
     double player_eye_y() const { return floor_y_at(player_pos_x, player_pos_y) + 0.5 + jump_height; }
 
@@ -783,30 +669,6 @@ public:
     // True if nothing blocks a straight line between two points in the maze (grid + connections).
     bool has_line_of_sight(double x0, double y0, double x1, double y1) {
         return line_of_sight(0, x0, y0, x1, y1);
-    }
-
-    // The same test on either level's walls.
-    bool line_of_sight(int level, double x0, double y0, double x1, double y1) {
-        const auto& g = grid_for(level);
-        auto& conn = conn_for(level);
-        double dx = x1 - x0, dy = y1 - y0;
-        double dist = std::hypot(dx, dy);
-        int steps = std::max(1, static_cast<int>(std::ceil(dist / 0.05)));
-        double sx = dx / steps, sy = dy / steps;
-        double cx = x0, cy = y0;
-        for (int i = 0; i < steps; ++i) {
-            double nx = cx + sx, ny = cy + sy;
-            int ocx = static_cast<int>(cx), ocy = static_cast<int>(cy);
-            int ncx = static_cast<int>(nx), ncy = static_cast<int>(ny);
-            if (ncx < 0 || ncx >= grid_size || ncy < 0 || ncy >= grid_size) return false;
-            if (g[ncy][ncx] != 0) return false;
-            if (ncx != ocx || ncy != ocy) {
-                if (std::abs(ncx - ocx) + std::abs(ncy - ocy) > 1) return false; // cut a corner
-                if (conn[{ocx, ocy}].find({ncx, ncy}) == conn[{ocx, ocy}].end()) return false;
-            }
-            cx = nx; cy = ny;
-        }
-        return true;
     }
 
     // A monster is "seen" when it is within the view cone and not hidden behind a wall.
@@ -1186,312 +1048,11 @@ public:
         return tex;
     }
 
-    std::optional<std::vector<std::pair<int, int>>> find_path() {
-        std::set<std::pair<int, int>> visited;
-        std::queue<std::pair<int, int>> queue;
-        std::map<std::pair<int, int>, std::pair<int, int>> parent;
-        queue.push(start);
-        visited.insert(start);
-        parent[start] = start;
-        while (!queue.empty()) {
-            auto pos = queue.front();
-            queue.pop();
-            if (pos == end) {
-                std::vector<std::pair<int, int>> path;
-                auto current = end;
-                while (current != start) {
-                    path.push_back(current);
-                    current = parent[current];
-                }
-                path.push_back(start);
-                std::reverse(path.begin(), path.end());
-                return path;
-            }
-            for (const auto& neigh : connections[pos]) {
-                if (visited.find(neigh) == visited.end()) {
-                    visited.insert(neigh);
-                    parent[neigh] = pos;
-                    queue.push(neigh);
-                }
-            }
-        }
-        return std::nullopt;
-    }
-
-    bool is_solvable() {
-        return find_path().has_value();
-    }
-
-    void generate_maze() {
-        int max_attempts = 10;
-        int attempt = 0;
-        bool solvable = false;
-        while (attempt < max_attempts) {
-            grid.assign(grid_size, std::vector<int>(grid_size, 1));
-            connections.clear();
-            start = { 0, 0 };
-            int half_size = grid_size / 2;
-            end = { std::uniform_int_distribution<int>(half_size, grid_size - 1)(rng), std::uniform_int_distribution<int>(half_size, grid_size - 1)(rng) };
-            std::set<std::pair<int, int>> visited;
-            grid[0][0] = 0;
-            visited.insert(start);
-            std::stack<std::pair<std::pair<int, int>, std::pair<int, int>>> stack;
-            stack.push({ start, {0, 0} });
-
-            std::vector<std::pair<int, int>> directions = { {-1, 0}, {1, 0}, {0, -1}, {0, 1} };
-            double extra_branch_prob = 0.3;
-
-            while (!stack.empty()) {
-                auto [pos, in_dir] = stack.top();
-                int x = pos.first, y = pos.second;
-                std::vector<std::tuple<int, int, std::pair<int, int>>> unvisited_neighbors;
-                for (const auto& d : directions) {
-                    int nx = x + d.first, ny = y + d.second;
-                    if (nx >= 0 && nx < grid_size && ny >= 0 && ny < grid_size && visited.find({ nx, ny }) == visited.end()) {
-                        unvisited_neighbors.emplace_back(nx, ny, d);
-                    }
-                }
-                if (!unvisited_neighbors.empty()) {
-                    std::vector<double> weights;
-                    double max_dist = grid_size * 2;
-                    for (const auto& [nx, ny, d] : unvisited_neighbors) {
-                        double dist = std::abs(nx - end.first) + std::abs(ny - end.second);
-                        double w = std::pow(max_dist - dist, 2);
-                        if (d == in_dir) w *= 5;
-                        weights.push_back(std::max(w, 0.001));
-                    }
-                    size_t chosen_idx = std::discrete_distribution<size_t>(weights.begin(), weights.end())(rng);
-                    auto [nx, ny, d] = unvisited_neighbors[chosen_idx];
-                    connections[pos].insert({ nx, ny });
-                    connections[{nx, ny}].insert(pos);
-                    grid[ny][nx] = 0;
-                    visited.insert({ nx, ny });
-                    stack.push({ {nx, ny}, d });
-
-                    unvisited_neighbors.erase(unvisited_neighbors.begin() + chosen_idx);
-                    weights.erase(weights.begin() + chosen_idx);
-
-                    if (std::uniform_real_distribution<double>(0.0, 1.0)(rng) < extra_branch_prob && !unvisited_neighbors.empty()) {
-                        size_t extra_idx = std::uniform_int_distribution<size_t>(0, unvisited_neighbors.size() - 1)(rng);
-                        auto [ex, ey, ed] = unvisited_neighbors[extra_idx];
-                        if (visited.find({ ex, ey }) == visited.end()) {
-                            connections[pos].insert({ ex, ey });
-                            connections[{ex, ey}].insert(pos);
-                            grid[ey][ex] = 0;
-                            visited.insert({ ex, ey });
-                            stack.push({ {ex, ey}, ed });
-                        }
-                    }
-                }
-                else {
-                    stack.pop();
-                }
-            }
-
-            auto path = find_path();
-            if (!path) {
-                int cx = start.first, cy = start.second;
-                while (cx != end.first) {
-                    int step = (end.first > cx) ? 1 : -1;
-                    int nx = cx + step;
-                    if (nx >= 0 && nx < grid_size && grid[cy][nx] == 1) {
-                        grid[cy][nx] = 0;
-                        connections[{cx, cy}].insert({ nx, cy });
-                        connections[{nx, cy}].insert({ cx, cy });
-                    }
-                    cx = nx;
-                }
-                while (cy != end.second) {
-                    int step = (end.second > cy) ? 1 : -1;
-                    int ny = cy + step;
-                    if (ny >= 0 && ny < grid_size && grid[ny][cx] == 1) {
-                        grid[ny][cx] = 0;
-                        connections[{cx, cy}].insert({ cx, ny });
-                        connections[{cx, ny}].insert({ cx, cy });
-                    }
-                    cy = ny;
-                }
-            }
-
-            rooms.clear();
-            int num_rooms = std::uniform_int_distribution<int>(1, 3)(rng);
-            for (int _ = 0; _ < num_rooms; _++) {
-                int room_size = std::uniform_int_distribution<int>(3, 5)(rng);
-                int max_start = grid_size - room_size;
-                int rx = std::uniform_int_distribution<int>(0, max_start)(rng);
-                int ry = std::uniform_int_distribution<int>(0, max_start)(rng);
-                rooms.emplace_back(rx, ry, room_size);
-                for (int dy = 0; dy < room_size; dy++) {
-                    for (int dx = 0; dx < room_size; dx++) {
-                        grid[ry + dy][rx + dx] = 0;
-                        if (dx < room_size - 1) {
-                            connections[{rx + dx, ry + dy}].insert({ rx + dx + 1, ry + dy });
-                            connections[{rx + dx + 1, ry + dy}].insert({ rx + dx, ry + dy });
-                        }
-                        if (dy < room_size - 1) {
-                            connections[{rx + dx, ry + dy}].insert({ rx + dx, ry + dy + 1 });
-                            connections[{rx + dx, ry + dy + 1}].insert({ rx + dx, ry + dy });
-                        }
-                    }
-                }
-            }
-
-            auto original_path = find_path();
-            size_t original_len = original_path ? original_path->size() : 0;
-
-            std::vector<std::pair<std::pair<int, int>, std::pair<int, int>>> possible_edges;
-            for (int y = 0; y < grid_size; y++) {
-                for (int x = 0; x < grid_size; x++) {
-                    if (grid[y][x] == 0) {
-                        for (const auto& d : directions) {
-                            int nx = x + d.first, ny = y + d.second;
-                            if (nx > x || (nx == x && ny > y)) {
-                                if (nx >= 0 && nx < grid_size && ny >= 0 && ny < grid_size && grid[ny][nx] == 0) {
-                                    if (connections[{x, y}].find({ nx, ny }) == connections[{x, y}].end()) {
-                                        possible_edges.emplace_back(std::make_pair(std::make_pair(x, y), std::make_pair(nx, ny)));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            std::shuffle(possible_edges.begin(), possible_edges.end(), rng);
-            int added_loops = 0;
-            int max_loops = 10;
-            for (auto& edge : possible_edges) {
-                auto u = edge.first, v = edge.second;
-                connections[u].insert(v);
-                connections[v].insert(u);
-                auto new_path = find_path();
-                size_t new_len = new_path ? new_path->size() : 0;
-                if (new_path && new_len >= original_len) {
-                    added_loops++;
-                    if (added_loops >= max_loops) break;
-                }
-                else {
-                    connections[u].erase(v);
-                    connections[v].erase(u);
-                    if (connections[u].empty()) connections.erase(u);
-                    if (connections[v].empty()) connections.erase(v);
-                }
-            }
-
-            if (is_solvable()) {
-                solvable = true;
-                break;
-            }
-            attempt++;
-        }
-
-        if (!solvable) {
-            std::cerr << "Failed to generate solvable maze" << std::endl;
-            exit(-1);
-        }
-    }
-
-    // The lower level is the opposite of the maze: everything is open floor, and only a
-    // handful of long straight walls break it into a few huge rooms. Each wall gets a
-    // doorway so the whole floor stays walkable.
-    void generate_lower_level() {
-        lower_grid.assign(grid_size, std::vector<int>(grid_size, 0));
-        lower_connections.clear();
-        for (int y = 0; y < grid_size; y++) {
-            for (int x = 0; x < grid_size; x++) {
-                if (x + 1 < grid_size) link(lower_connections, { x, y }, { x + 1, y });
-                if (y + 1 < grid_size) link(lower_connections, { x, y }, { x, y + 1 });
-            }
-        }
-
-        int num_walls = std::uniform_int_distribution<int>(4, 6)(rng);
-        for (int w = 0; w < num_walls; w++) {
-            bool vertical = std::uniform_int_distribution<int>(0, 1)(rng) == 0;
-            // The grid line the wall sits on, i.e. the seam between cells line-1 and line.
-            int line = std::uniform_int_distribution<int>(5, grid_size - 5)(rng);
-            int span = std::uniform_int_distribution<int>(12, 22)(rng);
-            int span_start = std::uniform_int_distribution<int>(0, grid_size - span)(rng);
-            int gap = span_start + span / 2; // a two-cell doorway through the middle
-            for (int i = span_start; i < span_start + span; i++) {
-                if (i == gap || i == gap + 1) continue;
-                if (vertical) unlink(lower_connections, { line - 1, i }, { line, i });
-                else          unlink(lower_connections, { i, line - 1 }, { i, line });
-            }
-        }
-    }
-
-    // Cut a straight staircase into the maze a couple of tiles in front of the spawn, running
-    // down to the lower level. The run belongs to both levels: it is chained together in each
-    // connection map, but only its top end opens onto the maze and only its bottom end opens
-    // onto the lower floor, so walking through it is the one way between the two.
-    void carve_staircase() {
-        const int stair_len = 5;
-        int sx = start.first + 2, sy = start.second;
-        stair_cells.clear();
-        for (int i = 0; i < stair_len; i++) stair_cells.emplace_back(sx + i, sy);
-
-        // Approach corridor from the spawn to the head of the stairs. Carving only ever opens
-        // cells, so it cannot make the maze unsolvable.
-        for (int x = start.first; x < sx; x++) {
-            grid[sy][x] = 0;
-            grid[sy][x + 1] = 0;
-            link(connections, { x, sy }, { x + 1, sy });
-        }
-
-        for (const auto& c : stair_cells) grid[c.second][c.first] = 0;
-        for (size_t i = 0; i + 1 < stair_cells.size(); i++) {
-            link(connections, stair_cells[i], stair_cells[i + 1]);
-            link(lower_connections, stair_cells[i], stair_cells[i + 1]);
-        }
-
-        // Seal every other edge of the shaft on both levels so you cannot step off mid-descent.
-        const int dxs[4] = { 1, -1, 0, 0 };
-        const int dys[4] = { 0, 0, 1, -1 };
-        for (const auto& c : stair_cells) {
-            for (int d = 0; d < 4; d++) {
-                std::pair<int, int> n{ c.first + dxs[d], c.second + dys[d] };
-                if (n.first < 0 || n.first >= grid_size || n.second < 0 || n.second >= grid_size) continue;
-                if (is_stair_cell(n.first, n.second)) continue;
-                unlink(connections, c, n);
-                unlink(lower_connections, c, n);
-            }
-        }
-
-        // Top of the stairs opens onto the maze; the bottom opens onto the lower floor.
-        link(connections, stair_cells.front(), { sx - 1, sy });
-        if (sx + stair_len < grid_size)
-            link(lower_connections, stair_cells.back(), { sx + stair_len, sy });
-
-        // Sealing the shaft cut every maze edge that ran into it, which could otherwise strand
-        // whatever hung off those cells - possibly the route to the exit. A corridor alongside
-        // the stairwell reconnects all of them: every neighbour the shaft lost now sits on it.
-        int bypass = sy + 1;
-        int bypass_end = std::min(sx + stair_len, grid_size - 1);
-        for (int x = start.first + 1; x <= bypass_end; x++) {
-            grid[bypass][x] = 0;
-            if (x > start.first + 1) link(connections, { x - 1, bypass }, { x, bypass });
-        }
-        link(connections, { start.first + 1, sy }, { start.first + 1, bypass });
-        grid[sy][bypass_end] = 0;
-        link(connections, { bypass_end, bypass }, { bypass_end, sy });
-    }
-
-    static uint32_t random_seed() {
-        std::random_device rd;
-        return rd() ^ static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-    }
-
     // Build a maze, its lower level, monsters and medpacks from one seed. In multiplayer every
-    // machine calls this with the host's seed and gets an identical world: the generator draws
-    // from the random stream in exactly the same order everywhere, and everyone runs the same
-    // build of the game, so even the standard library's distributions agree.
+    // machine - including a Linux dedicated server - calls this with the same seed and gets an
+    // identical world (see World::generate).
     void new_maze(uint32_t seed, bool reset_facing) {
-        rng.seed(seed);
-        generate_maze();
-        generate_lower_level();
-        carve_staircase();
-        spawn_monsters();
-        spawn_health_packs();
+        generate(seed);
         build_meshes();
         projectiles.clear();
         monster_projectiles.clear();
@@ -1504,20 +1065,6 @@ public:
     }
 
     void regenerate_maze() { new_maze(random_seed(), false); }
-
-    // Player 2 starts at the exit and escapes through Player 1's start, so the two swap ends.
-    std::pair<int, int> spawn_cell(int slot) const { return slot == 2 ? end : start; }
-    std::pair<int, int> exit_cell(int slot) const { return slot == 2 ? start : end; }
-
-    // A heading, in degrees, that looks down an open passage from a cell instead of at a wall.
-    double open_facing_yaw(std::pair<int, int> c) {
-        const int dxs[4] = { 1, 0, -1, 0 };
-        const int dys[4] = { 0, 1, 0, -1 };
-        for (int i = 0; i < 4; i++)
-            if (connections[c].count({ c.first + dxs[i], c.second + dys[i] }))
-                return glm::degrees(std::atan2(static_cast<double>(dys[i]), static_cast<double>(dxs[i])));
-        return 0.0;
-    }
 
     void face(double yaw_degrees) {
         yaw = yaw_degrees;
@@ -1608,77 +1155,6 @@ public:
         }
         player_pos_x = best_x + 0.5;
         player_pos_y = best_y + 0.5;
-    }
-
-    void spawn_monsters() {
-        monsters.clear();
-        std::vector<std::pair<int, int>> path_cells;
-        for (int y = 0; y < grid_size; y++) {
-            for (int x = 0; x < grid_size; x++) {
-                if (grid[y][x] == 0 && std::pair<int, int>{x, y} != start && std::pair<int, int>{x, y} != end
-                    && !is_stair_cell(x, y)) {
-                    bool in_room = false;
-                    for (const auto& room : rooms) {
-                        int rx, ry, rs;
-                        std::tie(rx, ry, rs) = room;
-                        if (rx <= x && x < rx + rs && ry <= y && y < ry + rs) {
-                            in_room = true;
-                            break;
-                        }
-                    }
-                    if (!in_room) path_cells.emplace_back(x, y);
-                }
-            }
-        }
-        std::shuffle(path_cells.begin(), path_cells.end(), rng);
-        int num_monsters = std::uniform_int_distribution<int>(5, 12)(rng);
-        for (int i = 0; i < std::min(num_monsters, (int)path_cells.size()); i++) {
-            int mx = path_cells[i].first, my = path_cells[i].second;
-            int hp = 300; // 3 body shots (100 each) or 1 headshot (300) to kill
-            monsters.push_back({ mx + 0.5, my + 0.5, hp, 1, mx + 0.5, my + 0.5, std::uniform_int_distribution<int>(0, 180)(rng) });
-        }
-        for (const auto& room : rooms) {
-            int rx, ry, rs;
-            std::tie(rx, ry, rs) = room;
-            int mx = rx + rs / 2;
-            int my = ry + rs / 2;
-            int boss_hp = std::uniform_int_distribution<int>(310, 440)(rng); // 7-9 body shots (50 each) or 3 headshots (150) to kill
-            monsters.push_back({ mx + 0.5, my + 0.5, boss_hp, 2, mx + 0.5, my + 0.5, std::uniform_int_distribution<int>(0, 60)(rng) });
-        }
-        // Ids follow spawn order, so every machine that built this maze agrees on them.
-        for (size_t i = 0; i < monsters.size(); i++) {
-            monsters[i].id = static_cast<int>(i);
-            monsters[i].net_x = monsters[i].x;
-            monsters[i].net_y = monsters[i].y;
-        }
-    }
-
-    void spawn_health_packs() {
-        health_packs.clear();
-        std::vector<std::pair<int, int>> path_cells;
-        for (int y = 0; y < grid_size; y++) {
-            for (int x = 0; x < grid_size; x++) {
-                if (grid[y][x] == 0 && std::pair<int, int>{x, y} != start && std::pair<int, int>{x, y} != end
-                    && !is_stair_cell(x, y)) path_cells.emplace_back(x, y);
-            }
-        }
-        std::shuffle(path_cells.begin(), path_cells.end(), rng);
-        for (int i = 0; i < 2 && i < path_cells.size(); i++) {
-            int hx = path_cells[i].first, hy = path_cells[i].second;
-            health_packs.push_back({ hx + std::uniform_real_distribution<double>(0.2, 0.8)(rng), hy + std::uniform_real_distribution<double>(0.2, 0.8)(rng), 0 });
-        }
-
-        // Two more on the lower level, anywhere on its open floor except the staircase itself.
-        std::vector<std::pair<int, int>> lower_cells;
-        for (int y = 0; y < grid_size; y++)
-            for (int x = 0; x < grid_size; x++)
-                if (lower_grid[y][x] == 0 && !is_stair_cell(x, y)) lower_cells.emplace_back(x, y);
-        std::shuffle(lower_cells.begin(), lower_cells.end(), rng);
-        for (int i = 0; i < 2 && i < static_cast<int>(lower_cells.size()); i++) {
-            int hx = lower_cells[i].first, hy = lower_cells[i].second;
-            health_packs.push_back({ hx + std::uniform_real_distribution<double>(0.2, 0.8)(rng), hy + std::uniform_real_distribution<double>(0.2, 0.8)(rng), 1 });
-        }
-        for (size_t i = 0; i < health_packs.size(); i++) health_packs[i].id = static_cast<int>(i);
     }
 
     bool try_move(double new_x, double new_y) {
@@ -1815,31 +1291,11 @@ public:
         last_damage_by = by;
     }
 
-    Monster* find_monster(int id) {
-        for (auto& m : monsters) if (m.id == id) return &m;
-        return nullptr;
-    }
-
-    int boss_count() const {
-        int n = 0;
-        for (const auto& m : monsters) if (m.type == 2) n++;
-        return n;
-    }
-
     // Authoritative damage to a monster: singleplayer and the host only. Clients report hits
     // with MSG_MONSTER_HIT and see the result in the next monster snapshot.
     void apply_monster_damage(int id, int dmg) {
-        for (auto it = monsters.begin(); it != monsters.end(); ++it) {
-            if (it->id != id) continue;
-            it->hp -= dmg;
-            it->hit_flash = 8; // briefly highlight red on a successful hit
-            if (it->hp <= 0) {
-                bool was_beast = (id == beast_boss_id);
-                monsters.erase(it);
-                if (was_beast && mode == Mode::Host) reassign_beast();
-            }
-            return;
-        }
+        bool was_beast = id == beast_boss_id;
+        if (damage_monster(id, dmg) && was_beast && mode == Mode::Host) reassign_beast();
     }
 
     void update_projectiles(double delta) {
@@ -1958,76 +1414,28 @@ public:
                 it = monster_projectiles.erase(it);
                 // The victim's own machine applies the damage; others just see the shot vanish.
                 if (hit_player && hit_player == my_slot)
-                    take_damage(was_boss ? std::uniform_int_distribution<int>(4, 5)(rng) : 1, owner); // 4-5 boss shots kill
+                    take_damage(was_boss ? rng.range(4, 5) : 1, owner); // 4-5 boss shots kill
             } else ++it;
         }
     }
 
+    // Singleplayer and a hosting player run the monsters (clients follow the snapshots). They
+    // shoot at the nearest living explorer on the maze level: in singleplayer, simply you.
     void update_monsters(double delta) {
-        std::vector<std::pair<int, int>> directions = { {-1, 0}, {1, 0}, {0, -1}, {0, 1} };
-        for (auto it = monsters.begin(); it != monsters.end(); ) {
-            if (it->hit_flash > 0) it->hit_flash--; // fade out the red hit highlight
-            // The boss Player 3 controls: no AI, it just glides to wherever they last reported.
-            if (beast_active() && it->id == beast_boss_id) {
-                double k = std::min(1.0, delta * 15.0);
-                it->x += (it->net_x - it->x) * k;
-                it->y += (it->net_y - it->y) * k;
-                it->target_x = it->x;
-                it->target_y = it->y;
-                ++it;
-                continue;
+        std::vector<Target> targets;
+        if (!is_beast() && player_level == 0 && !showing_die) targets.push_back({ player_pos_x, player_pos_y });
+        if (mode != Mode::Single) {
+            for (int s = 1; s <= 2; s++) {
+                if (s == my_slot) continue;
+                const RemotePlayer& r = remote[s];
+                if (r.present && r.has_state && r.alive && r.level == 0) targets.push_back({ r.x, r.y });
             }
-            double dx = it->target_x - it->x;
-            double dy = it->target_y - it->y;
-            double dist = std::sqrt(dx * dx + dy * dy);
-            if (dist < 0.01) {
-                int cx = static_cast<int>(it->x);
-                int cy = static_cast<int>(it->y);
-                std::vector<std::pair<double, double>> possible_targets;
-                for (const auto& d : directions) {
-                    int nx = cx + d.first, ny = cy + d.second;
-                    // Never wander onto the staircase: monsters have no notion of height and
-                    // would float above the steps.
-                    if (nx >= 0 && nx < grid_size && ny >= 0 && ny < grid_size && grid[ny][nx] == 0
-                        && connections[{cx, cy}].count({ nx, ny }) && !is_stair_cell(nx, ny)) {
-                        possible_targets.emplace_back(nx + 0.5, ny + 0.5);
-                    }
-                }
-                if (!possible_targets.empty()) {
-                    auto target = possible_targets[std::uniform_int_distribution<size_t>(0, possible_targets.size() - 1)(rng)];
-                    it->target_x = target.first;
-                    it->target_y = target.second;
-                }
-            }
-            else {
-                double speed = (it->type == 1 ? 0.0072 : 0.01275) * delta * 60.0; // monster -28%, boss -15%
-                it->x += (dx / dist) * speed;
-                it->y += (dy / dist) * speed;
-            }
-
-            it->cooldown -= 1;
-            if (it->cooldown <= 0) {
-                double tx = 0.0, ty = 0.0;
-                // Hold fire while nobody is on the maze level - the shot could not reach.
-                // The cooldown still resets below so they don't all volley the moment you return.
-                if (nearest_target(it->x, it->y, tx, ty)) {
-                    double dx_p = tx - it->x;
-                    double dy_p = ty - it->y;
-                    double p_dist = std::hypot(dx_p, dy_p);
-                    bool is_boss = (it->type == 2);
-                    Projectile mp;
-                    mp.x = it->x; mp.y = it->y;
-                    mp.dir_x = dx_p / p_dist; mp.dir_y = dy_p / p_dist;
-                    mp.speed = is_boss ? 0.0714 : 0.075; // boss projectiles slower than regular ones
-                    mp.from_boss = is_boss;
-                    mp.owner = 0;
-                    monster_projectiles.push_back(mp);
-                    if (mode == Mode::Host) send_shot(mp);
-                }
-                it->cooldown = (it->type == 2 ? 86 : 300); // boss fires 30% less often, monsters 40% less
-            }
-
-            ++it;
+        }
+        std::vector<Projectile> shots;
+        step_monsters(delta, beast_active() ? beast_boss_id : -1, targets, shots);
+        for (const auto& p : shots) {
+            monster_projectiles.push_back(p);
+            if (mode == Mode::Host) send_shot(p);
         }
     }
 
@@ -2885,53 +2293,6 @@ public:
 
     static void log(const std::string& line) { std::cout << line << std::endl; }
 
-    // The explorer a monster at (mx, my) shoots at: the nearest living one on the maze level.
-    // In singleplayer that's simply you, as before.
-    bool nearest_target(double mx, double my, double& tx, double& ty) {
-        double best = 1e18;
-        bool found = false;
-        auto consider = [&](double x, double y) {
-            double d = std::hypot(x - mx, y - my);
-            if (d > 0.0 && d < best) { best = d; tx = x; ty = y; found = true; }
-        };
-        if (!is_beast() && player_level == 0 && !showing_die) consider(player_pos_x, player_pos_y);
-        if (mode != Mode::Single) {
-            for (int s = 1; s <= 2; s++) {
-                if (s == my_slot) continue;
-                const RemotePlayer& r = remote[s];
-                if (r.present && r.has_state && r.alive && r.level == 0) consider(r.x, r.y);
-            }
-        }
-        return found;
-    }
-
-    // A fingerprint of the generated world. Every player logs it when a round starts, so a
-    // mismatch - two machines building different mazes from one seed - is easy to spot.
-    uint64_t world_checksum() const {
-        uint64_t h = 1469598103934665603ull;
-        auto mix = [&h](int64_t v) { h ^= static_cast<uint64_t>(v); h *= 1099511628211ull; };
-        auto mix_conn = [&](const std::map<std::pair<int, int>, std::set<std::pair<int, int>>>& conn) {
-            for (const auto& [cell, links] : conn) {
-                if (links.empty()) continue; // empty entries only exist from lookups, not layout
-                mix(cell.first * 64 + cell.second);
-                for (const auto& n : links) mix(10000 + n.first * 64 + n.second);
-            }
-        };
-        for (const auto& row : grid) for (int c : row) mix(c);
-        mix_conn(connections);
-        mix_conn(lower_connections);
-        mix(start.first); mix(start.second); mix(end.first); mix(end.second);
-        for (const auto& m : monsters) {
-            mix(m.id); mix(m.type); mix(m.hp);
-            mix(std::llround(m.x * 1000.0)); mix(std::llround(m.y * 1000.0));
-        }
-        for (const auto& p : health_packs) {
-            mix(p.id); mix(p.level);
-            mix(std::llround(p.x * 1000.0)); mix(std::llround(p.y * 1000.0));
-        }
-        return h;
-    }
-
     // ---- Sending ----------------------------------------------------------------------------
 
     // Host: to every client. Client: to the host, which relays it to everyone else.
@@ -3037,7 +2398,8 @@ public:
                 leave_multiplayer("Could not reach " + join_target() + " (UDP).");
             }
             else {
-                leave_multiplayer("The host closed the game.");
+                // A server that stopped, or a connection that dropped (ENet notices within ~10 s).
+                leave_multiplayer(server_dedicated ? "Lost the connection to the server." : "The host closed the game.");
                 open_menu(Screen::Main);
             }
             return;
@@ -3201,7 +2563,8 @@ public:
             remote[free_slot] = RemotePlayer{};
             remote[free_slot].present = true;
             net::Writer w;
-            w.put<uint8_t>(MSG_WELCOME).put<uint8_t>(static_cast<uint8_t>(free_slot)).put<uint32_t>(round_seed);
+            w.put<uint8_t>(MSG_WELCOME).put<uint8_t>(static_cast<uint8_t>(free_slot)).put<uint32_t>(round_seed)
+             .put<uint8_t>(0); // flags: a player's game, not a dedicated server; never mid-round
             net.send(peer, w.buf, true);
             broadcast_lobby();
             log("[net] player " + std::to_string(free_slot) + " joined (" + std::to_string(player_count()) + "/3)");
@@ -3263,31 +2626,54 @@ public:
         case MSG_WELCOME: {
             int slot = r.get<uint8_t>();
             uint32_t seed = r.get<uint32_t>();
-            if (!r.ok || slot < 2 || slot > 3) return;
+            uint8_t flags = r.get<uint8_t>();
+            bool dedicated = (flags & WELCOME_DEDICATED) != 0;
+            // A player's game is always Player 1 itself; on a dedicated server anyone can be.
+            if (!r.ok || slot < (dedicated ? 1 : 2) || slot > 3) return;
             my_slot = slot;
             round_seed = seed;
+            server_dedicated = dedicated;
+            joined_in_progress = (flags & WELCOME_IN_PROGRESS) != 0;
             join_connecting = false;
             join_connected = true;
             menu_status.clear();
-            lobby_mask = static_cast<uint8_t>(lobby_mask | 1 | (1 << slot));
+            lobby_mask = static_cast<uint8_t>((dedicated ? 0 : 1 << 1) | (1 << slot)); // the LOBBY message follows
             glfwSetWindowTitle(window, ("MazeBeasts - Player " + std::to_string(slot)).c_str());
-            log("[net] joined as player " + std::to_string(slot));
+            log("[net] joined " + std::string(dedicated ? "a dedicated server" : "a player's game") + " as player "
+                + std::to_string(slot) + (joined_in_progress ? ", playing from the next maze" : ""));
             return;
         }
         case MSG_REJECT: {
             int reason = r.get<uint8_t>();
             std::string why = reason == REJECT_IN_PROGRESS ? "That game has already started."
                             : reason == REJECT_FULL ? "That game is full (3 players)."
-                            : "That host is running a different version of MazeBeasts.";
+                            : "That host or server is running a different version of MazeBeasts.";
             leave_multiplayer(why);
             return;
         }
         case MSG_ASSIGN: {
             int slot = r.get<uint8_t>();
-            if (!r.ok || slot < 2 || slot > 3) return;
+            if (!r.ok || slot < (server_dedicated ? 1 : 2) || slot > 3) return;
             my_slot = slot;
             glfwSetWindowTitle(window, ("MazeBeasts - Player " + std::to_string(slot)).c_str());
             log("[net] now player " + std::to_string(slot));
+            return;
+        }
+        case MSG_TO_LOBBY: {
+            // Dedicated server: every explorer left this maze, so it ended without a winner.
+            if (!in_round) return;
+            in_round = false;
+            round_over = false;
+            spectating = false;
+            showing_die = false;
+            free_fly = false;
+            beast_boss_id = -1;
+            feed.clear();
+            stop_boss_sound();
+            open_menu(Screen::Join);
+            menu_status = "The explorers left, so that maze ended.";
+            menu_status_error = false;
+            log("[mp] back to the lobby");
             return;
         }
         case MSG_LOBBY: {
@@ -3435,7 +2821,7 @@ public:
     // Back to singleplayer: close the connection, and if a multiplayer maze was in play, give
     // the player a fresh solo one - a shared maze isn't a singleplayer game.
     void leave_multiplayer(const std::string& why) {
-        bool had_round = mode != Mode::Single && in_round;
+        bool had_round = mp_maze;
         net.stop();
         mode = Mode::Single;
         my_slot = 1;
@@ -3446,9 +2832,12 @@ public:
         lobby_mask = 1 << 1;
         join_connecting = false;
         join_connected = false;
+        server_dedicated = false;
+        joined_in_progress = false;
         for (auto& p : remote) p = RemotePlayer{};
         for (int& p : slot_peer) p = -1;
         feed.clear();
+        mp_maze = false;
         if (had_round) new_maze(random_seed(), true);
         glfwSetWindowTitle(window, "MazeBeasts - 3D");
         menu_status = why;
@@ -3466,7 +2855,7 @@ public:
             std::vector<int> bosses;
             for (const auto& m : monsters) if (m.type == 2) bosses.push_back(m.id);
             if (!bosses.empty())
-                beast_boss_id = bosses[std::uniform_int_distribution<size_t>(0, bosses.size() - 1)(rng)];
+                beast_boss_id = bosses[static_cast<size_t>(rng.range(0, static_cast<int>(bosses.size()) - 1))];
         }
         net::Writer w;
         w.put<uint8_t>(MSG_START).put<uint8_t>(round_id).put<uint32_t>(round_seed)
@@ -3477,6 +2866,9 @@ public:
 
     void begin_round_local() {
         in_round = true;
+        mp_maze = true;
+        joined_in_progress = false;
+        menu_status.clear();
         round_over = false;
         round_winner = 0;
         exit_reported = false;
@@ -3526,7 +2918,7 @@ public:
             std::vector<int> bosses;
             for (const auto& m : monsters) if (m.type == 2) bosses.push_back(m.id);
             if (!bosses.empty()) {
-                beast_boss_id = bosses[std::uniform_int_distribution<size_t>(0, bosses.size() - 1)(rng)];
+                beast_boss_id = bosses[static_cast<size_t>(rng.range(0, static_cast<int>(bosses.size()) - 1))];
                 if (Monster* m = find_monster(beast_boss_id)) { m->net_x = m->x; m->net_y = m->y; }
             }
         }
@@ -3655,6 +3047,14 @@ public:
         case MenuAction::TestSound:
             play_sound("monster_sound.flac");
             break;
+        case MenuAction::RequestStart: {
+            net::Writer w;
+            w.put<uint8_t>(MSG_REQUEST_START);
+            net.send_to_host(w.buf, true);
+            menu_status = "Starting...";
+            menu_status_error = false;
+            break;
+        }
         case MenuAction::StartGame:
             host_start_round();
             break;
@@ -3764,21 +3164,42 @@ public:
                 }
                 for (int i = 0; i < backspaces && !join_address.empty(); i++) join_address.pop_back();
             }
-            text("Host IP address:", bright);
+            text("Host or server IP address:", bright);
             items.push_back({ INPUT, join_address, bright, 0.9f, 60.0f });
             text("UDP port " + port + ", or type address:port for another", dim);
             gap(6.0f);
+            bool can_start = false;
             if (join_connected) {
-                text("Connected as " + capitalised(player_name(my_slot))
-                     + (my_slot == 2 ? " - you start at the exit" : " - you'll control a boss"), player_color(my_slot));
-                text("Waiting for the host to start the game (" + std::to_string(player_count()) + "/3 players)", dim);
+                std::string role = my_slot == 1 ? " - you start where singleplayer does"
+                                 : my_slot == 2 ? " - you start at the exit" : " - you'll control a boss";
+                text((server_dedicated ? "On the server as " : "Connected as ") + capitalised(player_name(my_slot)) + role,
+                     player_color(my_slot));
+                int n = player_count();
+                std::string players = " (" + std::to_string(n) + "/3 players)";
+                if (joined_in_progress) text("A maze is under way - you'll join in at the next one" + players, dim);
+                else if (!server_dedicated) text("Waiting for the host to start the game" + players, dim);
+                else if (my_slot != 1) text("Waiting for Player 1 to start the game" + players, dim);
+                else if (n < 2) text("Waiting for another player to join" + players, dim);
+                else { text("Start when everyone is here" + players, good); can_start = true; }
             }
-            buttons = { { "Connect", MenuAction::Connect, editable && !join_address.empty() },
-                        { "Back", MenuAction::BackFromJoin, true } };
-            hint = editable ? "Type the host's IP address, then press Enter" : "Esc: leave";
+            // On a dedicated server nobody is the host, so Player 1 starts the game from here.
+            if (join_connected && server_dedicated && my_slot == 1)
+                buttons = { { "Start the game", MenuAction::RequestStart, can_start },
+                            { "Leave", MenuAction::BackFromJoin, true } };
+            else
+                buttons = { { "Connect", MenuAction::Connect, editable && !join_address.empty() },
+                            { "Back", MenuAction::BackFromJoin, true } };
+            hint = editable ? "Type the host's or server's IP address, then press Enter" : "Esc: leave";
         }
         if (!menu_status.empty()) text(menu_status, menu_status_error ? bad : dim);
         gap(10.0f);
+
+        // A first button that becomes available (Start, once someone joins) takes the focus,
+        // so Enter starts the game instead of hitting the Cancel or Leave it was parked on.
+        bool first_enabled = !buttons.empty() && buttons[0].enabled;
+        if (screen == focus_screen && first_enabled && !first_was_enabled) menu_focus = 0;
+        focus_screen = screen;
+        first_was_enabled = first_enabled;
 
         // ---- Fit it to the window ----------------------------------------------------------
         const float button_h = 50.0f, button_gap = 12.0f, hint_h = hint.empty() ? 0.0f : 36.0f;
@@ -3855,7 +3276,7 @@ public:
             y += bh + button_gap * ui;
         }
         if (!hint.empty()) draw_text_centered(hint, cx, y + 22.0f * ui, dim, 0.6f * ui);
-        draw_text("v0.3", W - 52.0f * std::max(ui, 0.6f), H - 10.0f, { 0.45f, 0.45f, 0.52f, 1.0f }, 0.55f * std::max(ui, 0.6f));
+        draw_text("v0.4", W - 52.0f * std::max(ui, 0.6f), H - 10.0f, { 0.45f, 0.45f, 0.52f, 1.0f }, 0.55f * std::max(ui, 0.6f));
         glEnable(GL_DEPTH_TEST);
 
         // ---- Input, after drawing: an action may switch screens ---------------------------------
@@ -4140,12 +3561,18 @@ public:
         bool controls = screen == Screen::None;
         bool can_move = controls && !spectating;
 
-        // F8 makes a new maze: in singleplayer straight away; in multiplayer only the host can,
-        // and it starts a new round for everyone. One maze per press, not one per frame held.
+        // F8 makes a new maze: in singleplayer straight away; in multiplayer only the host (or
+        // Player 1, on a dedicated server) can, and it starts a new round for everyone. One maze
+        // per press, not one per frame held.
         bool f8_down = controls && glfwGetKey(window, GLFW_KEY_F8) == GLFW_PRESS;
         if (f8_down && !f8_pressed) {
             if (mode == Mode::Single) regenerate_maze();
             else if (mode == Mode::Host) host_start_round();
+            else if (server_dedicated && my_slot == 1) {
+                net::Writer w;
+                w.put<uint8_t>(MSG_REQUEST_START);
+                net.send_to_host(w.buf, true);
+            }
         }
         f8_pressed = f8_down;
 
@@ -4659,7 +4086,8 @@ public:
         if (mode != Mode::Single && in_round) {
             float w = static_cast<float>(screen_width);
             float minimap_right = 16.0f + std::max(64.0f, std::min(w, static_cast<float>(screen_height)) / 5.0f);
-            std::string goal = my_slot == 1 ? "Player 1 (host): kill the bosses, then reach the exit"
+            std::string goal = my_slot == 1 ? (mode == Mode::Host ? "Player 1 (host): kill the bosses, then reach the exit"
+                                                                  : "Player 1: kill the bosses, then reach the exit")
                              : my_slot == 2 ? "Player 2: kill the bosses, then reach Player 1's starting point"
                              : "Player 3 - the Beast: hunt the explorers down";
             float room = w - 2.0f * (minimap_right + 12.0f);

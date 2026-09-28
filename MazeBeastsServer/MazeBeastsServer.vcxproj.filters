@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Shared with the game">
+      <UniqueIdentifier>{3A6E1F52-9B1C-4E7D-A0F4-5C2D8B7E6A13}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ENet">
+      <UniqueIdentifier>{9B7D4E2A-3C61-4F0E-8A55-2E6B1D7C4F90}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="server.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MazeBeasts\world.cpp">
+      <Filter>Shared with the game</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MazeBeasts\net.cpp">
+      <Filter>Shared with the game</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MazeBeasts\enet\callbacks.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MazeBeasts\enet\compress.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MazeBeasts\enet\host.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MazeBeasts\enet\list.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MazeBeasts\enet\packet.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MazeBeasts\enet\peer.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MazeBeasts\enet\protocol.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\MazeBeasts\enet\win32.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\MazeBeasts\net.h">
+      <Filter>Shared with the game</Filter>
+    </ClInclude>
+    <ClInclude Include="..\MazeBeasts\protocol.h">
+      <Filter>Shared with the game</Filter>
+    </ClInclude>
+    <ClInclude Include="..\MazeBeasts\world.h">
+      <Filter>Shared with the game</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Makefile" />
+  </ItemGroup>
+</Project>

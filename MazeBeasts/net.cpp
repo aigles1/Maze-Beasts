@@ -1,14 +1,25 @@
-// ENet-backed implementation of net.h. This is the only file that sees enet.h / winsock.
+// ENet-backed implementation of net.h. This is the only file that sees enet.h and the
+// operating system's socket headers: Winsock for the game, BSD sockets for a Linux server.
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#endif
 #include "net.h"
 
 #include <enet/enet.h>
+#ifdef _WIN32
 #include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include <algorithm>
 #include <cstdint>
 
@@ -108,11 +119,13 @@ void Session::stop() {
 bool Session::active() const { return impl->host != nullptr; }
 bool Session::is_host() const { return impl->host != nullptr && impl->hosting; }
 
-std::vector<Event> Session::poll() {
+std::vector<Event> Session::poll(int wait_ms) {
     std::vector<Event> out;
     if (!impl->host) return out;
     ENetEvent ev;
-    while (impl->host && enet_host_service(impl->host, &ev, 0) > 0) {
+    // Wait (up to wait_ms) for the first event, then take whatever else has already arrived.
+    int got = enet_host_service(impl->host, &ev, static_cast<enet_uint32>(std::max(0, wait_ms)));
+    for (; got > 0 && impl->host; got = impl->host ? enet_host_service(impl->host, &ev, 0) : 0) {
         switch (ev.type) {
         case ENET_EVENT_TYPE_CONNECT:
             if (impl->hosting) {
@@ -183,6 +196,13 @@ void Session::drop(int peer) {
 
 void Session::flush() {
     if (impl->host) enet_host_flush(impl->host);
+}
+
+std::string Session::peer_address(int peer) const {
+    if (!impl->hosting || peer < 0 || peer >= static_cast<int>(impl->clients.size()) || !impl->clients[peer]) return "?";
+    char buf[64] = {};
+    if (enet_address_get_host_ip(&impl->clients[peer]->address, buf, sizeof(buf)) != 0) return "?";
+    return std::string(buf) + ":" + std::to_string(impl->clients[peer]->address.port);
 }
 
 std::vector<std::string> Session::local_ipv4_addresses() const {

@@ -27,6 +27,9 @@
     <ClCompile Include="net.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="world.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="enet\callbacks.c">
       <Filter>ENet</Filter>
     </ClCompile>
@@ -57,6 +60,12 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="net.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="protocol.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="world.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
