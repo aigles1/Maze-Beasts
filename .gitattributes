@@ -1,0 +1,2 @@
+# make needs Unix line endings, whatever the checkout does with the rest.
+MazeBeastsServer/Makefile text eol=lf

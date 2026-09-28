@@ -146,6 +146,7 @@
     <ClCompile Include="mazebeasts.cpp" />
     <ClCompile Include="glad.c" />
     <ClCompile Include="net.cpp" />
+    <ClCompile Include="world.cpp" />
     <ClCompile Include="enet\callbacks.c">
       <SDLCheck>false</SDLCheck>
       <DisableSpecificWarnings>5287;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -194,6 +195,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="net.h" />
+    <ClInclude Include="protocol.h" />
+    <ClInclude Include="world.h" />
   </ItemGroup>
   <ItemGroup>
     <Font Include="LiberationSans-Regular.ttf" />

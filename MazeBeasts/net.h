@@ -2,7 +2,8 @@
 //
 // This header deliberately does not include enet.h. ENet pulls in <winsock2.h>, and the main
 // game source already includes <windows.h> through miniaudio; mixing the two in one translation
-// unit causes redefinition errors. Everything ENet-specific lives in net.cpp instead.
+// unit causes redefinition errors. Everything ENet-specific lives in net.cpp instead, which
+// also builds on Linux for the dedicated server.
 #pragma once
 
 #include <cstdint>
@@ -40,13 +41,16 @@ public:
     bool active() const;
     bool is_host() const;
 
-    std::vector<Event> poll(); // pump the network; call once per frame
+    // Pump the network: call once per frame. A server with nothing else to do can wait up to
+    // wait_ms for the first message instead of spinning.
+    std::vector<Event> poll(int wait_ms = 0);
 
     void send(int peer, const std::vector<uint8_t>& msg, bool reliable);  // host -> one client
     void send_to_host(const std::vector<uint8_t>& msg, bool reliable);    // client -> host
     void broadcast(const std::vector<uint8_t>& msg, bool reliable, int except_peer = -1); // host
     void drop(int peer); // host: disconnect one client, e.g. after rejecting it
     void flush();        // push queued packets out now instead of at the next poll
+    std::string peer_address(int peer) const; // host: "ip:port" of a client, for logs
 
     // This machine's IPv4 addresses (loopback and link-local excluded), to show the host
     // what to tell the other players.
@@ -57,8 +61,9 @@ private:
     std::unique_ptr<Impl> impl;
 };
 
-// Minimal binary message writer/reader. Values are copied in native byte order: every build of
-// this game is x86-64 Windows, so both ends always agree.
+// Minimal binary message writer/reader. Values are copied in native byte order: the game
+// (x86-64 Windows) and the server (x86-64 or ARM64 Linux) are all little-endian with IEEE
+// floats, so every end agrees.
 class Writer {
 public:
     template <typename T> Writer& put(T v) {

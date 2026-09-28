@@ -29,11 +29,11 @@ While spectating in multiplayer, **W A S D** and the mouse fly you around, **Spa
 Press **Esc** for the menu: **Singleplayer**, **Multiplayer - Join**, **Multiplayer - Host**, **Sound** and **Exit**.
 
 - **Hosting:** choose *Multiplayer - Host*. The lobby shows your IP address and a maze seed, and says *Waiting for players*. Once a second player joins it shows *2/3 players joined* and you can click **Start the game**.
-- **Joining:** choose *Multiplayer - Join*, type the host's IP address and press **Connect**. The game uses **UDP port 29180**; to reach a different port, type `address:port`.
+- **Joining:** choose *Multiplayer - Join*, type the host's (or dedicated server's) IP address and press **Connect**. The game uses **UDP port 29180**; to reach a different port, type `address:port`.
 
 **Two or three players:**
 
-- **Player 1** (the host) starts where singleplayer does, and has the same goal: kill the bosses, then reach the exit.
+- **Player 1** (the host, or the first to join a dedicated server) starts where singleplayer does, and has the same goal: kill the bosses, then reach the exit.
 - **Player 2** starts at the exit, and must escape through Player 1's starting point.
 - Both players hunt the same bosses, so every boss killed helps both of you toward your own exit.
 - The explorers are soldiers in urban camouflage with blue helmets, and they can shoot each other. A killed player spectates for 5 seconds, flying freely around the maze, then respawns at their own starting point.
@@ -45,6 +45,16 @@ Press **Esc** for the menu: **Singleplayer**, **Multiplayer - Join**, **Multipla
 - Over the internet, the host must forward UDP port 29180 on their router.
 
 **Trying it on one PC:** run `Test multiplayer on this PC.bat` from the release folder. It opens two windowed copies side by side, and you connect one to the other with `127.0.0.1`. You can also start copies yourself with `MazeBeasts.exe --windowed=left` and `--windowed=right`.
+
+## Dedicated server
+
+Instead of one player hosting, everyone can join a **dedicated server**: a separate program with no window that runs the maze, its monsters and the rounds. It builds and runs on Linux, so it can live on a cloud machine such as an AWS EC2 instance, and nobody has to forward ports on their router.
+
+- Players join it with *Multiplayer - Join* and its IP address. The first to join is Player 1 and starts the game from the lobby. Player 1 can press **F8** for a new maze.
+- Someone who joins while a maze is under way plays from the next maze.
+- `Test with a dedicated server.bat` opens two game windows and connects both to a server you name. `Test dedicated server on this PC.bat` runs the Windows build of the server (`MazeBeastsServer.exe`) with two games joined to it.
+
+See [MazeBeastsServer/README.md](MazeBeastsServer/README.md) to build it on Linux and set it up on EC2.
 
 ## Why C++
 
@@ -67,6 +77,12 @@ Tested on Windows 11. No Visual C++ Redistributable or other installs are needed
 4. Put `x64\Release\MazeBeasts.exe` and `MazeBeasts\assets.dat` in the same folder and run the exe.
 
 When run from Visual Studio, the game falls back to the loose asset files in the project folder, so step 3 is only needed for a standalone copy.
+
+The solution also builds the dedicated server, `x64\Release\MazeBeastsServer.exe`. For Linux, run `make` in `MazeBeastsServer`, or pack a self-contained source bundle to copy to a Linux machine:
+
+```
+powershell -ExecutionPolicy Bypass -File tools\make-server-bundle.ps1
+```
 
 ## Future plans
 
