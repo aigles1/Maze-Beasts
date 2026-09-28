@@ -16,6 +16,8 @@
 #include <optional>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 
 #include "net.h" // multiplayer; kept free of winsock so it can't clash with miniaudio's <windows.h>
 
@@ -248,8 +250,10 @@ struct LaunchOptions {
     double quit_after = 0.0; // --quit-after=SECONDS: close by itself (automated tests)
     bool test = false;       // --test: small unfocused window, mouse left free, sound off
     bool test_fire = false;  // --test-fire: shoot every 2 s without input (tests the shot relay)
-    bool test_spawn_near = false; // --test-spawn-near: Player 2 starts face to face with Player 1
+    bool test_spawn_near = false; // --test-spawn-near[=YAW]: Player 2 starts face to face with Player 1
+    double test_spawn_yaw = 180.0; //   (or turned to YAW degrees, to look at the model from other sides)
     bool open_menu = false;  // --open-menu: start with the Esc menu showing
+    bool open_sound = false; // --open-menu=sound: ...on its Sound page
     std::string screenshot;  // --screenshot=FILE: save the last frame as a .bmp before quitting
 };
 
@@ -428,15 +432,15 @@ private:
     static constexpr double BEAST_FIRE_INTERVAL = 0.6;        // seconds between the Beast's shots
     static constexpr int    BEAST_MAX_HP        = 440;        // top of the boss health range
     static constexpr double ROUND_OVER_SECONDS  = 5.0;        // winner banner before the next maze
-    // Other players are drawn as a small figure: about 0.6 tall, head roughly at eye height.
-    static constexpr float  PLAYER_SPRITE_HALF  = 0.36f;
-    static constexpr float  PLAYER_SPRITE_SINK  = 0.72f * 6.0f / 128.0f; // empty rows under the feet
-    static constexpr double PLAYER_HIT_RADIUS   = 0.22;
+    static constexpr double RESPAWN_SECONDS     = 5.0;        // spectating after a death in multiplayer
+    // Other players are a 3D soldier 0.6 tall (see build_player_model). The hit cylinder hugs
+    // that figure; it was 0.22 wide for the old flat sprite, which spread its arms and gun out.
+    static constexpr double PLAYER_HIT_RADIUS   = 0.16;
     static constexpr double PLAYER_HIT_HEIGHT   = 0.6;
 
     enum class Mode { Single, Host, Client };
-    enum class Screen { None, Main, Host, Join };
-    enum class MenuAction { None, Single, Join, Host, Exit, StartGame, CancelHost, Connect, BackFromJoin };
+    enum class Screen { None, Main, Host, Join, Sound };
+    enum class MenuAction { None, Single, Join, Host, Sound, Exit, StartGame, CancelHost, Connect, BackFromJoin, BackFromSound, TestSound };
 
     struct RemotePlayer {
         bool present = false;    // in this game (lobby or round)
@@ -448,6 +452,8 @@ private:
         bool alive = true;
         double flash_until = 0;  // brief red tint after being hurt
         bool logged = false;     // first-position log line already written this round
+        double walk_phase = 0;   // where the legs are in their stride
+        double walk_amount = 0;  // 0 standing still .. 1 full stride, eased so legs settle
     };
 
     LaunchOptions opts;
@@ -466,6 +472,10 @@ private:
     int slot_peer[4] = { -1, -1, -1, -1 }; // host: which network peer holds each slot
     int beast_boss_id = -1;      // boss Player 3 controls, or -1
     bool spectating = false;     // the Beast with no boss left to control
+    // Spectating (dead and waiting to respawn, or the Beast with no boss left) is a free
+    // camera: it flies through walls and floors, and fly_y is its height.
+    bool free_fly = false;
+    double fly_y = 0.5;
     int last_damage_by = 0;      // who hurt us last, so a death names the killer
     int killed_by = 0;
     bool exit_reported = false;
@@ -475,13 +485,27 @@ private:
     double last_beast_shot = -10.0;
     std::vector<std::pair<std::string, double>> feed; // kill feed: text, time it disappears
     std::vector<std::string> host_ips;
-    GLuint player_tex = 0;
     glm::mat4 last_proj = glm::mat4(1.0f), last_view = glm::mat4(1.0f); // for name labels
+
+    // Other players' 3D figure: a soldier built in code (see build_player_model). Each part is
+    // its own mesh so it can turn about a joint: the legs stride, and the head and arms follow
+    // where the player is aiming. Faces carry baked light as vertex colours; only the
+    // camouflage trousers are textured, and their indices come first in each part.
+    enum PlayerPart { PART_BODY, PART_HEAD, PART_ARMS, PART_LEG_L, PART_LEG_R, PART_COUNT };
+    struct ModelPart {
+        GLuint vao = 0, vbo = 0, ebo = 0;
+        GLsizei textured = 0, plain = 0; // index counts
+        glm::vec3 pivot{ 0.0f };         // the joint it turns about, in model metres
+    };
+    ModelPart player_parts[PART_COUNT];
+    GLuint camo_tex = 0;
+    static constexpr float PLAYER_MODEL_SCALE = 0.6f / 1.84f; // modelled 1.84 m tall, drawn 0.6
 
     // Menu UI state
     std::string menu_status;
     bool menu_status_error = false;
     std::string join_address = "127.0.0.1";
+    uint16_t join_port = net::DEFAULT_PORT;
     bool join_connecting = false, join_connected = false;
     int menu_focus = 0;
     double menu_last_mx = -1.0, menu_last_my = -1.0;
@@ -489,6 +513,12 @@ private:
     bool up_prev = false, down_prev = false, enter_prev = false;
     std::string typed;           // characters typed this frame (from the char callback)
     int backspaces = 0;          // backspace presses this frame, including key repeat
+    int left_presses = 0, right_presses = 0; // arrow presses this frame, for the volume slider
+
+    // Sound option: one master volume for every sound, kept between runs.
+    float master_volume = 1.0f;  // slider position, 0..1
+    bool volume_dirty = false;   // changed since it was last saved
+    bool slider_dragging = false;
 
 public:
     MazeGame(const LaunchOptions& options) : opts(options), rng(static_cast<std::mt19937::result_type>(
@@ -500,6 +530,7 @@ public:
         else
             std::cerr << "assets.dat not found; falling back to loose files." << std::endl;
 
+        load_settings();
         init_glfw();
         init_glad();
         init_opengl();
@@ -507,8 +538,8 @@ public:
         init_font();
         init_draw_buffers();
         build_gun_mesh();
+        build_player_model();
         load_textures();
-        player_tex = create_player_texture();
         new_maze(random_seed(), true);
 
         if (opts.host) begin_hosting();
@@ -517,14 +548,20 @@ public:
             open_menu(Screen::Join);
             begin_join();
         }
-        else if (opts.open_menu) open_menu(Screen::Main);
+        else if (opts.open_menu) open_menu(opts.open_sound ? Screen::Sound : Screen::Main);
         run();
     }
 
     ~MazeGame() {
         net.stop(); // tell the other players we've gone, rather than leaving them to time out
+        if (volume_dirty) save_settings();
         release_level_meshes();
-        glDeleteTextures(1, &player_tex);
+        for (auto& p : player_parts) {
+            glDeleteVertexArrays(1, &p.vao);
+            glDeleteBuffers(1, &p.vbo);
+            glDeleteBuffers(1, &p.ebo);
+        }
+        glDeleteTextures(1, &camo_tex);
         glDeleteVertexArrays(1, &gun_vao);
         glDeleteBuffers(1, &gun_vbo);
         glDeleteBuffers(1, &gun_ebo);
@@ -573,11 +610,52 @@ public:
             sound_ready = false;
         } else {
             sound_ready = true;
+            apply_volume();
         }
     }
 
     void play_sound(const char* file) {
         if (sound_ready) ma_engine_play_sound(&sound_engine, file, nullptr);
+    }
+
+    // The slider is perceptual: loudness follows roughly the square of the gain, so halfway
+    // sounds about half as loud instead of barely quieter.
+    void apply_volume() {
+        if (sound_ready) ma_engine_set_volume(&sound_engine, master_volume * master_volume);
+    }
+
+    void set_volume(float v) {
+        v = std::round(std::clamp(v, 0.0f, 1.0f) * 100.0f) / 100.0f;
+        if (v == master_volume) return;
+        master_volume = v;
+        volume_dirty = true;
+        apply_volume();
+    }
+
+    // Settings live in %APPDATA%\MazeBeasts, so they carry over to the next release's folder.
+    static std::filesystem::path settings_path() {
+        const wchar_t* appdata = _wgetenv(L"APPDATA");
+        std::filesystem::path dir = appdata && *appdata ? std::filesystem::path(appdata) / L"MazeBeasts"
+                                                        : std::filesystem::path(L".");
+        return dir / L"settings.txt";
+    }
+
+    void load_settings() {
+        std::ifstream in(settings_path());
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.rfind("volume=", 0) == 0)
+                master_volume = std::clamp(static_cast<float>(std::atof(line.c_str() + 7)), 0.0f, 1.0f);
+        }
+    }
+
+    void save_settings() {
+        volume_dirty = false;
+        if (opts.test) return; // automated test copies leave your settings alone
+        std::error_code ec;
+        std::filesystem::create_directories(settings_path().parent_path(), ec);
+        std::ofstream out(settings_path());
+        if (out) out << "volume=" << master_volume << "\n";
     }
 
     // Boss cue loops while the player is in a boss room; kept as a handle so it can be stopped.
@@ -659,6 +737,40 @@ public:
     }
 
     double player_eye_y() const { return floor_y_at(player_pos_x, player_pos_y) + 0.5 + jump_height; }
+
+    // Where the camera is: your eyes, or the free camera while spectating.
+    double camera_y() const { return free_fly ? fly_y : player_eye_y(); }
+
+    // Leave your body where it fell and float up out of it.
+    void start_free_fly() {
+        if (free_fly) return;
+        free_fly = true;
+        fly_y = player_eye_y();
+        jump_height = 0.0;
+        jump_velocity = 0.0;
+    }
+
+    // The spectator camera: WASD moves along where you're looking (look down and press W to
+    // dive), Space rises and Ctrl or C sinks. It passes through walls and floors but stays
+    // inside the outer walls, between the lower floor and the maze's ceiling.
+    void fly(double speed) {
+        auto held = [&](int key) { return glfwGetKey(window, key) == GLFW_PRESS; };
+        double cp = std::cos(glm::radians(pitch)), sp = std::sin(glm::radians(pitch));
+        double mx = 0.0, my = 0.0, mz = 0.0;
+        if (held(GLFW_KEY_W)) { mx += dir_x * cp; my += sp; mz += dir_y * cp; }
+        if (held(GLFW_KEY_S)) { mx -= dir_x * cp; my -= sp; mz -= dir_y * cp; }
+        if (held(GLFW_KEY_D)) { mx -= dir_y; mz += dir_x; }
+        if (held(GLFW_KEY_A)) { mx += dir_y; mz -= dir_x; }
+        if (held(GLFW_KEY_SPACE)) my += 1.0;
+        if (held(GLFW_KEY_LEFT_CONTROL) || held(GLFW_KEY_RIGHT_CONTROL) || held(GLFW_KEY_C)) my -= 1.0;
+        double len = std::sqrt(mx * mx + my * my + mz * mz);
+        if (len > 1.0) { mx /= len; my /= len; mz /= len; } // diagonals are no faster
+        const double edge = 0.05;
+        player_pos_x = std::clamp(player_pos_x + mx * speed, edge, grid_size - edge);
+        player_pos_y = std::clamp(player_pos_y + mz * speed, edge, grid_size - edge);
+        fly_y = std::clamp(fly_y + my * speed, lower_floor_y + 0.1, 0.92);
+        player_level = fly_y < 0.0 ? 1 : 0; // the map and minimap follow the camera between floors
+    }
 
     // The staircase cells belong to both levels, so which level the player counts as being on
     // is decided by how far down the stairs they are. By the time they can step off either end
@@ -811,16 +923,23 @@ public:
         if (codepoint >= 32 && codepoint < 127) game->typed.push_back(static_cast<char>(codepoint));
     }
 
-    // Backspace comes through here rather than polling so that holding it repeats.
+    // Backspace and the arrows come through here rather than polling, so holding them repeats.
     static void key_callback(GLFWwindow* w, int key, int, int action, int) {
         MazeGame* game = static_cast<MazeGame*>(glfwGetWindowUserPointer(w));
-        if (key == GLFW_KEY_BACKSPACE && (action == GLFW_PRESS || action == GLFW_REPEAT)) game->backspaces++;
+        if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+        if (key == GLFW_KEY_BACKSPACE) game->backspaces++;
+        else if (key == GLFW_KEY_LEFT) game->left_presses++;
+        else if (key == GLFW_KEY_RIGHT) game->right_presses++;
     }
 
-    // Coming back to the window (alt-tab, or clicking between copies) mustn't jerk the view.
+    // Coming back to the window (alt-tab, or clicking between copies) mustn't jerk the view,
+    // and the click that brought it to the front mustn't fire a shot.
     static void focus_callback(GLFWwindow* w, int focused) {
         MazeGame* game = static_cast<MazeGame*>(glfwGetWindowUserPointer(w));
-        if (focused) game->first_mouse = true;
+        if (focused) {
+            game->first_mouse = true;
+            game->fire_pressed = true;
+        }
     }
 
     static void framebuffer_size_callback(GLFWwindow* w, int width, int height) {
@@ -842,6 +961,9 @@ public:
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         shader_program = create_shader();
+        // Meshes without per-vertex colours read this constant instead: plain white, so the
+        // shader's colour multiply leaves them exactly as before.
+        glVertexAttrib4f(2, 1.0f, 1.0f, 1.0f, 1.0f);
     }
 
     GLuint create_shader() {
@@ -849,13 +971,16 @@ public:
         #version 330 core
         layout (location = 0) in vec3 aPos;
         layout (location = 1) in vec2 aTexCoord;
+        layout (location = 2) in vec4 aColor; // only the player model supplies this; others get white
         out vec2 TexCoord;
+        out vec4 VertColor;
         uniform mat4 model;
         uniform mat4 view;
         uniform mat4 projection;
         void main() {
             gl_Position = projection * view * model * vec4(aPos, 1.0);
             TexCoord = aTexCoord;
+            VertColor = aColor;
         }
         )";
 
@@ -863,14 +988,15 @@ public:
         #version 330 core
         out vec4 FragColor;
         in vec2 TexCoord;
+        in vec4 VertColor;
         uniform sampler2D texture1;
         uniform int use_texture;
         uniform vec4 color;
         void main() {
             if (use_texture == 1) {
-                FragColor = texture(texture1, TexCoord) * color;
+                FragColor = texture(texture1, TexCoord) * color * VertColor;
             } else {
-                FragColor = color;
+                FragColor = color * VertColor;
             }
         }
         )";
@@ -1407,6 +1533,7 @@ public:
         player_level = 0;
         jump_height = 0.0;
         jump_velocity = 0.0;
+        free_fly = false;
         player_hp = max_hp;
         damage_cooldown = 0;
         last_damage_by = 0;
@@ -1415,7 +1542,7 @@ public:
             // Test only: one tile in front of Player 1, looking back at them.
             player_pos_x = start.first + 1.5;
             player_pos_y = start.second + 0.5;
-            face(180.0);
+            face(opts.test_spawn_yaw);
         }
     }
 
@@ -2173,6 +2300,307 @@ public:
         glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(id));
     }
 
+    // Black-and-grey urban camouflage, generated rather than loaded: four tones laid down as
+    // overlapping blotches of smooth noise. The noise wraps at the texture's edges, so the
+    // pattern tiles without seams.
+    GLuint create_camo_texture() {
+        const int S = 128;
+        auto hash = [](int x, int y, uint32_t seed) {
+            uint32_t h = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(y) * 668265263u + seed * 2246822519u;
+            h = (h ^ (h >> 13)) * 1274126177u;
+            return static_cast<float>((h ^ (h >> 16)) & 0xFFFFFFu) / 16777215.0f;
+        };
+        auto noise = [&](float x, float y, int period, uint32_t seed) {
+            int x0 = static_cast<int>(std::floor(x)), y0 = static_cast<int>(std::floor(y));
+            float fx = x - x0, fy = y - y0;
+            fx = fx * fx * (3.0f - 2.0f * fx);
+            fy = fy * fy * (3.0f - 2.0f * fy);
+            auto at = [&](int i, int j) { return hash(((i % period) + period) % period, ((j % period) + period) % period, seed); };
+            float a = at(x0, y0), b = at(x0 + 1, y0), c = at(x0, y0 + 1), d = at(x0 + 1, y0 + 1);
+            return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+        };
+        auto blotch = [&](int px, int py, int period, uint32_t seed) {
+            float v = 0.0f, amp = 1.0f, norm = 0.0f;
+            for (int octave = 0; octave < 3; octave++, period *= 2, amp *= 0.5f) {
+                v += amp * noise(px * period / static_cast<float>(S), py * period / static_cast<float>(S),
+                                 period, seed + static_cast<uint32_t>(octave) * 7919u);
+                norm += amp;
+            }
+            return v / norm;
+        };
+        std::vector<unsigned char> px(static_cast<size_t>(S) * S * 3);
+        for (int y = 0; y < S; y++) {
+            for (int x = 0; x < S; x++) {
+                unsigned char g = 150;                     // light grey, about a quarter
+                if (blotch(x, y, 4, 11u) > 0.46f) g = 96;  // mid grey
+                if (blotch(x, y, 4, 23u) > 0.61f) g = 52;  // charcoal
+                if (blotch(x, y, 5, 37u) > 0.64f) g = 16;  // black
+                unsigned char* p = &px[(static_cast<size_t>(y) * S + x) * 3];
+                p[0] = p[1] = p[2] = g;
+            }
+        }
+        GLuint tex;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, S, S, 0, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+        glGenerateMipmap(GL_TEXTURE_2D);
+        return tex;
+    }
+
+    // The other players: a soldier in urban-camouflage trousers, a grey shirt and black boots,
+    // with black skin and a helmet and chin strap in the old Player 2 blue. Built once from
+    // boxes and ellipsoids, in metres with the feet at the origin, facing +Z; that makes
+    // their right-hand side -X. Light is baked into vertex colours, as on your own gun.
+    void build_player_model() {
+        camo_tex = create_camo_texture();
+
+        struct Vert { glm::vec3 p; glm::vec2 uv; glm::vec4 c; };
+        struct Build { std::vector<Vert> verts; std::vector<unsigned int> tex, plain; };
+        Build parts[PART_COUNT];
+
+        const glm::vec3 light = glm::normalize(glm::vec3(-0.30f, 0.80f, 0.52f));
+        auto lit = [&](glm::vec3 col, glm::vec3 n, bool emissive) {
+            float s = emissive ? 1.0f : 0.36f + 0.64f * std::max(0.0f, glm::dot(glm::normalize(n), light));
+            return glm::vec4(col * s, 1.0f);
+        };
+
+        const glm::vec3 WHITE(1.0f);                      // camouflage: the texture is the colour
+        const glm::vec3 SHIRT(0.50f, 0.51f, 0.53f);
+        const glm::vec3 COLLAR(0.40f, 0.41f, 0.43f);
+        const glm::vec3 SKIN(0.10f, 0.09f, 0.09f);
+        const glm::vec3 BOOT(0.07f, 0.07f, 0.075f);
+        const glm::vec3 PAD(0.17f, 0.17f, 0.18f);
+        const glm::vec3 BELT(0.11f, 0.11f, 0.11f);
+        const glm::vec3 BUCKLE(0.40f, 0.40f, 0.42f);
+        const glm::vec3 GUN(0.14f, 0.15f, 0.16f);
+        const glm::vec3 TRIM(0.33f, 0.97f, 0.97f);       // the cyan on your own gun
+        const glm::vec3 BLUE(player_color(2));            // what Player 2's sprite used to be
+
+        // A box, optionally rotated. Camouflage faces tile the texture every 0.5 m, each face
+        // starting from a different spot so the pattern doesn't repeat across them.
+        int face_seed = 0;
+        auto box = [&](int part, glm::vec3 c, glm::vec3 h, glm::mat3 rot, glm::vec3 col, bool camo, bool emissive = false) {
+            const glm::vec3 nrm[6] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
+            const int idx[6][4] = { {1,5,7,3}, {4,0,2,6}, {2,3,7,6}, {4,5,1,0}, {5,4,6,7}, {0,1,3,2} };
+            glm::vec3 p[8];
+            for (int i = 0; i < 8; i++)
+                p[i] = c + rot * glm::vec3((i & 1) ? h.x : -h.x, (i & 2) ? h.y : -h.y, (i & 4) ? h.z : -h.z);
+            Build& b = parts[part];
+            for (int f = 0; f < 6; f++) {
+                glm::vec4 colour = lit(col, rot * nrm[f], emissive);
+                face_seed++;
+                glm::vec2 off(std::fmod(face_seed * 0.37f, 1.0f), std::fmod(face_seed * 0.61f, 1.0f));
+                float u = glm::length(p[idx[f][1]] - p[idx[f][0]]) / 0.5f;
+                float v = glm::length(p[idx[f][3]] - p[idx[f][0]]) / 0.5f;
+                const glm::vec2 uv[4] = { off, off + glm::vec2(u, 0.0f), off + glm::vec2(u, v), off + glm::vec2(0.0f, v) };
+                unsigned int base = static_cast<unsigned int>(b.verts.size());
+                for (int k = 0; k < 4; k++) b.verts.push_back({ p[idx[f][k]], uv[k], colour });
+                auto& list = camo ? b.tex : b.plain;
+                for (unsigned int i : { 0u, 1u, 2u, 0u, 2u, 3u }) list.push_back(base + i);
+            }
+        };
+        const glm::mat3 I(1.0f);
+        auto upright = [&](int part, glm::vec3 c, glm::vec3 h, glm::vec3 col, bool camo = false) { box(part, c, h, I, col, camo); };
+
+        // A limb: a box running from joint a to joint b.
+        auto limb = [&](int part, glm::vec3 a, glm::vec3 b, float hw, float hd, glm::vec3 col, bool camo = false) {
+            glm::vec3 axis = b - a;
+            float len = glm::length(axis);
+            glm::vec3 y = axis / len;
+            glm::vec3 ref = std::fabs(y.x) < 0.9f ? glm::vec3(1.0f, 0.0f, 0.0f) : glm::vec3(0.0f, 0.0f, 1.0f);
+            glm::vec3 x = glm::normalize(ref - y * glm::dot(ref, y));
+            box(part, (a + b) * 0.5f, glm::vec3(hw, len * 0.5f, hd), glm::mat3(x, y, glm::cross(x, y)), col, camo);
+        };
+
+        // A smooth-shaded slice of an ellipsoid between two latitudes (degrees, 90 = the top).
+        auto ellipsoid = [&](int part, glm::vec3 c, glm::vec3 r, float lat0, float lat1, glm::vec3 col) {
+            const int lon_segs = 18, lat_segs = 7;
+            Build& b = parts[part];
+            unsigned int base = static_cast<unsigned int>(b.verts.size());
+            for (int i = 0; i <= lat_segs; i++) {
+                float lat = glm::radians(lat0 + (lat1 - lat0) * i / lat_segs);
+                for (int j = 0; j <= lon_segs; j++) {
+                    float lon = glm::two_pi<float>() * j / lon_segs;
+                    glm::vec3 d(std::cos(lat) * std::sin(lon), std::sin(lat), std::cos(lat) * std::cos(lon));
+                    b.verts.push_back({ c + d * r, glm::vec2(0.0f), lit(col, d / r, false) });
+                }
+            }
+            for (int i = 0; i < lat_segs; i++) {
+                for (int j = 0; j < lon_segs; j++) {
+                    unsigned int a0 = base + i * (lon_segs + 1) + j, a1 = a0 + 1;
+                    unsigned int b0 = a0 + lon_segs + 1, b1 = b0 + 1;
+                    for (unsigned int k : { a0, a1, b1, a0, b1, b0 }) b.plain.push_back(k);
+                }
+            }
+        };
+
+        // ---- Legs: boots, camouflage trousers and knee pads, each swinging from the hip.
+        for (int side = 0; side < 2; side++) {
+            int part = side == 0 ? PART_LEG_L : PART_LEG_R;
+            float x = side == 0 ? 0.105f : -0.105f;
+            upright(part, { x, 0.060f, 0.035f }, { 0.068f, 0.060f, 0.135f }, BOOT);
+            limb(part, { x, 0.11f, 0.0f }, { x, 0.52f, 0.0f }, 0.074f, 0.084f, WHITE, true); // shin
+            limb(part, { x, 0.50f, 0.0f }, { x, 0.96f, 0.0f }, 0.090f, 0.102f, WHITE, true); // thigh
+            upright(part, { x, 0.50f, 0.088f }, { 0.060f, 0.060f, 0.016f }, PAD);
+        }
+
+        // ---- Body: hips, belt, grey shirt, shoulders and neck.
+        upright(PART_BODY, { 0.0f, 0.975f, 0.0f }, { 0.195f, 0.090f, 0.112f }, WHITE, true);
+        upright(PART_BODY, { 0.0f, 1.070f, 0.0f }, { 0.200f, 0.030f, 0.118f }, BELT);
+        upright(PART_BODY, { 0.0f, 1.070f, 0.119f }, { 0.032f, 0.022f, 0.006f }, BUCKLE);
+        upright(PART_BODY, { 0.0f, 1.190f, 0.0f }, { 0.190f, 0.095f, 0.110f }, SHIRT);
+        upright(PART_BODY, { 0.0f, 1.370f, 0.0f }, { 0.215f, 0.115f, 0.125f }, SHIRT);
+        ellipsoid(PART_BODY, { 0.212f, 1.425f, 0.0f }, { 0.066f, 0.060f, 0.076f }, -90.0f, 90.0f, SHIRT);
+        ellipsoid(PART_BODY, { -0.212f, 1.425f, 0.0f }, { 0.066f, 0.060f, 0.076f }, -90.0f, 90.0f, SHIRT);
+        upright(PART_BODY, { 0.0f, 1.495f, 0.0f }, { 0.085f, 0.015f, 0.075f }, COLLAR);
+        upright(PART_BODY, { 0.0f, 1.540f, 0.0f }, { 0.050f, 0.045f, 0.050f }, SKIN);
+
+        // ---- Head: black, under a blue helmet with a flared rim, and a blue chin strap.
+        const glm::vec3 head_c(0.0f, 1.640f, 0.005f), head_r(0.085f, 0.105f, 0.100f);
+        ellipsoid(PART_HEAD, head_c, head_r, -90.0f, 90.0f, SKIN);
+        const glm::vec3 helmet_c(0.0f, 1.665f, -0.005f), helmet_r(0.125f, 0.160f, 0.140f);
+        ellipsoid(PART_HEAD, helmet_c, helmet_r, 0.0f, 90.0f, BLUE);
+        {
+            // The rim: a short skirt below the dome, flaring out a little as it goes down.
+            const int segs = 18;
+            const float drop = 0.030f, flare = 1.08f;
+            Build& b = parts[PART_HEAD];
+            unsigned int base = static_cast<unsigned int>(b.verts.size());
+            for (int j = 0; j <= segs; j++) {
+                float lon = glm::two_pi<float>() * j / segs;
+                glm::vec3 d(std::sin(lon), 0.0f, std::cos(lon));
+                glm::vec3 top = helmet_c + d * helmet_r;
+                glm::vec3 bottom = helmet_c + glm::vec3(d.x * helmet_r.x * flare, -drop, d.z * helmet_r.z * flare);
+                glm::vec3 n = glm::normalize(glm::vec3(d.x / helmet_r.x, 0.0f, d.z / helmet_r.z)) + glm::vec3(0.0f, 0.3f, 0.0f);
+                glm::vec4 colour = lit(BLUE, n, false);
+                b.verts.push_back({ top, glm::vec2(0.0f), colour });
+                b.verts.push_back({ bottom, glm::vec2(0.0f), colour });
+            }
+            for (int j = 0; j < segs; j++) {
+                unsigned int a0 = base + 2 * j, a1 = a0 + 1, b0 = a0 + 2, b1 = a0 + 3;
+                for (unsigned int k : { a0, a1, b1, a0, b1, b0 }) b.plain.push_back(k);
+            }
+        }
+        {
+            // The chin strap runs from under the rim on one side, beneath the chin, to the
+            // other side, lying just off the surface of the head.
+            const glm::vec3 side(1.0f, 0.0f, 0.0f), under = glm::normalize(glm::vec3(0.0f, -0.85f, 0.53f));
+            const glm::vec3 across = glm::normalize(glm::cross(side, under));
+            const int segs = 16;
+            const float half_w = 0.011f;
+            Build& b = parts[PART_HEAD];
+            unsigned int base = static_cast<unsigned int>(b.verts.size());
+            for (int i = 0; i <= segs; i++) {
+                float t = glm::pi<float>() * i / segs;
+                glm::vec3 d = glm::normalize(std::cos(t) * side + std::sin(t) * under);
+                float to_surface = 1.0f / std::sqrt(glm::dot(d / head_r, d / head_r));
+                glm::vec3 p = head_c + d * to_surface * 1.06f;
+                glm::vec4 colour = lit(BLUE, d / (head_r * head_r), false);
+                b.verts.push_back({ p + across * half_w, glm::vec2(0.0f), colour });
+                b.verts.push_back({ p - across * half_w, glm::vec2(0.0f), colour });
+            }
+            for (int i = 0; i < segs; i++) {
+                unsigned int a0 = base + 2 * i, a1 = a0 + 1, b0 = a0 + 2, b1 = a0 + 3;
+                for (unsigned int k : { a0, a1, b1, a0, b1, b0 }) b.plain.push_back(k);
+            }
+        }
+
+        // ---- Arms and rifle, held at the ready on the right; they pitch together to aim.
+        const glm::vec3 r_shoulder(-0.225f, 1.43f, 0.0f), r_elbow(-0.26f, 1.16f, -0.02f), r_hand(-0.105f, 1.21f, 0.19f);
+        const glm::vec3 l_shoulder(0.225f, 1.43f, 0.0f), l_elbow(0.12f, 1.19f, 0.22f), l_hand(-0.085f, 1.25f, 0.38f);
+        limb(PART_ARMS, r_shoulder, r_elbow, 0.058f, 0.062f, SHIRT);
+        limb(PART_ARMS, r_elbow, r_hand, 0.045f, 0.048f, SKIN);
+        limb(PART_ARMS, l_shoulder, l_elbow, 0.058f, 0.062f, SHIRT);
+        limb(PART_ARMS, l_elbow, l_hand, 0.045f, 0.048f, SKIN);
+        upright(PART_ARMS, r_hand, { 0.032f, 0.036f, 0.032f }, SKIN);
+        upright(PART_ARMS, l_hand, { 0.032f, 0.036f, 0.032f }, SKIN);
+        const float gx = -0.105f;
+        upright(PART_ARMS, { gx, 1.275f, 0.250f }, { 0.030f, 0.045f, 0.160f }, GUN);  // receiver
+        upright(PART_ARMS, { gx, 1.290f, 0.520f }, { 0.016f, 0.016f, 0.120f }, GUN);  // barrel
+        upright(PART_ARMS, { gx, 1.260f, 0.040f }, { 0.026f, 0.042f, 0.070f }, GUN);  // stock
+        upright(PART_ARMS, { gx, 1.195f, 0.300f }, { 0.022f, 0.060f, 0.030f }, GUN);  // magazine
+        upright(PART_ARMS, { gx, 1.330f, 0.200f }, { 0.012f, 0.012f, 0.040f }, GUN);  // sight
+        box(PART_ARMS, { gx + 0.031f, 1.290f, 0.280f }, { 0.002f, 0.008f, 0.120f }, I, TRIM, false, true); // glowing
+        box(PART_ARMS, { gx - 0.031f, 1.290f, 0.280f }, { 0.002f, 0.008f, 0.120f }, I, TRIM, false, true);
+
+        player_parts[PART_HEAD].pivot = { 0.0f, 1.52f, 0.0f };
+        player_parts[PART_ARMS].pivot = { 0.0f, 1.42f, 0.0f };
+        player_parts[PART_LEG_L].pivot = { 0.105f, 0.95f, 0.0f };
+        player_parts[PART_LEG_R].pivot = { -0.105f, 0.95f, 0.0f };
+
+        for (int i = 0; i < PART_COUNT; i++) {
+            const Build& b = parts[i];
+            std::vector<float> data;
+            data.reserve(b.verts.size() * 9);
+            for (const Vert& v : b.verts)
+                data.insert(data.end(), { v.p.x, v.p.y, v.p.z, v.uv.x, v.uv.y, v.c.r, v.c.g, v.c.b, v.c.a });
+            std::vector<unsigned int> inds = b.tex;
+            inds.insert(inds.end(), b.plain.begin(), b.plain.end());
+
+            ModelPart& m = player_parts[i];
+            m.textured = static_cast<GLsizei>(b.tex.size());
+            m.plain = static_cast<GLsizei>(b.plain.size());
+            glGenVertexArrays(1, &m.vao);
+            glBindVertexArray(m.vao);
+            glGenBuffers(1, &m.vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
+            glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(float), data.data(), GL_STATIC_DRAW);
+            glGenBuffers(1, &m.ebo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m.ebo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, inds.size() * sizeof(unsigned int), inds.data(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 9 * sizeof(float), nullptr);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(3 * sizeof(float)));
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(5 * sizeof(float)));
+        }
+        glBindVertexArray(0);
+    }
+
+    // One soldier standing at (x, feet height, y), facing along yaw, with the head and rifle
+    // following the pitch and the legs mid-stride. The tint is multiplied over everything.
+    void draw_player_model(double x, double feet, double y, double yaw_deg, double pitch_deg,
+                           double walk_phase, double walk_amount, glm::vec4 tint) {
+        // The model faces +Z; turn that onto the heading (cos yaw, sin yaw) in the maze.
+        float yaw_r = glm::radians(static_cast<float>(yaw_deg));
+        glm::mat4 base = glm::translate(glm::mat4(1.0f), glm::vec3(static_cast<float>(x), static_cast<float>(feet), static_cast<float>(y)));
+        base = glm::rotate(base, std::atan2(std::cos(yaw_r), std::sin(yaw_r)), glm::vec3(0.0f, 1.0f, 0.0f));
+        base = glm::scale(base, glm::vec3(PLAYER_MODEL_SCALE));
+
+        // Turning about +X by a negative angle tips the front (+Z) upward.
+        float aim = glm::radians(std::clamp(static_cast<float>(pitch_deg), -60.0f, 60.0f));
+        float swing = glm::radians(34.0f) * static_cast<float>(walk_amount) * std::sin(static_cast<float>(walk_phase));
+        const float angle[PART_COUNT] = { 0.0f, -aim * 0.6f, -aim, swing, -swing };
+
+        glUniform4f(glGetUniformLocation(shader_program, "color"), tint.r, tint.g, tint.b, tint.a);
+        glBindTexture(GL_TEXTURE_2D, camo_tex);
+        for (int i = 0; i < PART_COUNT; i++) {
+            const ModelPart& p = player_parts[i];
+            glm::mat4 m = base;
+            if (angle[i] != 0.0f)
+                m = glm::translate(m, p.pivot) * glm::rotate(glm::mat4(1.0f), angle[i], glm::vec3(1.0f, 0.0f, 0.0f))
+                  * glm::translate(glm::mat4(1.0f), -p.pivot);
+            glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(m));
+            glBindVertexArray(p.vao);
+            if (p.textured) {
+                glUniform1i(glGetUniformLocation(shader_program, "use_texture"), 1);
+                glDrawElements(GL_TRIANGLES, p.textured, GL_UNSIGNED_INT, nullptr);
+            }
+            if (p.plain) {
+                glUniform1i(glGetUniformLocation(shader_program, "use_texture"), 0);
+                glDrawElements(GL_TRIANGLES, p.plain, GL_UNSIGNED_INT, (void*)(p.textured * sizeof(unsigned int)));
+            }
+        }
+        glm::mat4 id = glm::mat4(1.0f);
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(id));
+        glVertexAttrib4f(2, 1.0f, 1.0f, 1.0f, 1.0f); // back to white for meshes without colours
+    }
+
     // GPU buffers for the current maze. Rebuilding a maze used to allocate a fresh set without
     // freeing the old one; with a new maze every multiplayer round that leak adds up.
     bool meshes_built = false;
@@ -2606,8 +3034,7 @@ public:
         if (mode == Mode::Client) {
             if (!join_connected) {
                 // No Connected ever arrived: nobody answered at that address.
-                leave_multiplayer("Could not reach " + join_address + " on UDP port "
-                                  + std::to_string(net::DEFAULT_PORT) + ".");
+                leave_multiplayer("Could not reach " + join_target() + " (UDP).");
             }
             else {
                 leave_multiplayer("The host closed the game.");
@@ -2963,23 +3390,46 @@ public:
         log("[net] hosting on UDP port " + std::to_string(net::DEFAULT_PORT) + ", maze seed " + std::to_string(round_seed));
     }
 
+    // "1.2.3.4", "1.2.3.4:29180" or a host name, optionally with a port. On failure, says why.
+    static bool split_address(const std::string& text, std::string& host, uint16_t& port, std::string& error) {
+        host = text;
+        port = net::DEFAULT_PORT;
+        size_t colon = text.rfind(':');
+        if (colon == std::string::npos) return true;
+        host = text.substr(0, colon);
+        std::string digits = text.substr(colon + 1);
+        bool numeric = !digits.empty() && digits.size() <= 5
+                    && std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; });
+        long value = numeric ? std::atol(digits.c_str()) : 0;
+        if (host.empty() || host.find(':') != std::string::npos || value < 1 || value > 65535) {
+            error = "\"" + text + "\" isn't an address. Use an IP like 1.2.3.4 or 1.2.3.4:29180.";
+            return false;
+        }
+        port = static_cast<uint16_t>(value);
+        return true;
+    }
+
+    std::string join_target() const { return join_address.find(':') == std::string::npos ? join_address + ":" + std::to_string(join_port) : join_address; }
+
     void begin_join() {
-        std::string err;
-        if (!net.start_client(join_address, net::DEFAULT_PORT, err)) {
+        std::string err, host;
+        uint16_t port = net::DEFAULT_PORT;
+        if (!split_address(join_address, host, port, err) || !net.start_client(host, port, err)) {
             menu_status = err;
             menu_status_error = true;
             log("[net] " + err);
             return;
         }
+        join_port = port;
         mode = Mode::Client;
         in_round = false;
         join_connecting = true;
         join_connected = false;
         lobby_mask = 1 << 1;
         for (auto& p : remote) p = RemotePlayer{};
-        menu_status = "Connecting to " + join_address + ":" + std::to_string(net::DEFAULT_PORT) + "...";
+        menu_status = "Connecting to " + join_target() + "...";
         menu_status_error = false;
-        log("[net] connecting to " + join_address + ":" + std::to_string(net::DEFAULT_PORT));
+        log("[net] connecting to " + join_target());
     }
 
     // Back to singleplayer: close the connection, and if a multiplayer maze was in play, give
@@ -3054,10 +3504,12 @@ public:
         const Monster* m = find_monster(beast_boss_id);
         if (!m) {
             spectating = true;
+            start_free_fly(); // fly around and watch until the next maze
             log("[mp] no boss left to control - spectating");
             return;
         }
         spectating = false;
+        free_fly = false;
         player_pos_x = m->x;
         player_pos_y = m->y;
         player_level = 0;
@@ -3098,8 +3550,16 @@ public:
         double k = std::min(1.0, delta * 15.0);
         for (auto& r : remote) {
             if (!r.has_state) continue;
+            double ox = r.rx, oy = r.ry;
             r.rx += (r.x - r.rx) * k;
             r.ry += (r.y - r.ry) * k;
+            // Legs stride in step with the ground covered: one full cycle every 0.62 units,
+            // easing to a stop rather than freezing mid-step.
+            double moved = std::hypot(r.rx - ox, r.ry - oy);
+            double stride = delta > 0.0 ? std::clamp(moved / delta / 2.0, 0.0, 1.0) : 0.0;
+            if (r.jump > 0.02) stride = 0.0; // legs together in the air
+            r.walk_amount += (stride - r.walk_amount) * std::min(1.0, delta * 8.0);
+            r.walk_phase = std::fmod(r.walk_phase + moved * glm::two_pi<double>() / 0.62, glm::two_pi<double>());
         }
     }
 
@@ -3158,6 +3618,7 @@ public:
             case Screen::Main: close_menu(); break;
             case Screen::Host: menu_action(MenuAction::CancelHost); break;
             case Screen::Join: menu_action(MenuAction::BackFromJoin); break;
+            case Screen::Sound: menu_action(MenuAction::BackFromSound); break;
             }
         }
         esc_pressed = down;
@@ -3181,6 +3642,18 @@ public:
             break;
         case MenuAction::Exit:
             glfwSetWindowShouldClose(window, true);
+            break;
+        case MenuAction::Sound:
+            // Just a settings page: it doesn't leave a multiplayer game.
+            open_menu(Screen::Sound);
+            break;
+        case MenuAction::BackFromSound:
+            if (volume_dirty) save_settings();
+            open_menu(Screen::Main);
+            menu_focus = 3; // back on the Sound button
+            break;
+        case MenuAction::TestSound:
+            play_sound("monster_sound.flac");
             break;
         case MenuAction::StartGame:
             host_start_round();
@@ -3228,7 +3701,7 @@ public:
         const std::string port = std::to_string(net::DEFAULT_PORT);
 
         // ---- Describe the page -------------------------------------------------------------
-        enum ItemKind { TEXT, INPUT, GAP };
+        enum ItemKind { TEXT, INPUT, SLIDER, GAP };
         struct Item { ItemKind kind; std::string text; glm::vec4 color; float scale; float height; };
         std::vector<Item> items;
         auto text = [&](const std::string& s, glm::vec4 c) { items.push_back({ TEXT, s, c, 0.75f, 32.0f }); };
@@ -3243,9 +3716,24 @@ public:
             buttons = { { "Singleplayer", MenuAction::Single, true },
                         { "Multiplayer - Join", MenuAction::Join, true },
                         { "Multiplayer - Host", MenuAction::Host, true },
+                        { "Sound", MenuAction::Sound, true },
                         { "Exit", MenuAction::Exit, true } };
             hint = mode == Mode::Single ? "Esc: back to the game"
-                                        : "Esc: back to the game.  Choosing another option leaves this multiplayer game.";
+                                        : "Esc: back to the game.  Singleplayer, Join or Host leave this match.";
+        }
+        else if (screen == Screen::Sound) {
+            for (int i = 0; i < left_presses; i++) set_volume(master_volume - 0.05f);
+            for (int i = 0; i < right_presses; i++) set_volume(master_volume + 0.05f);
+            text("Sound", bright);
+            gap(8.0f);
+            text("Volume: " + std::to_string(static_cast<int>(std::lround(master_volume * 100.0f))) + "%",
+                 master_volume > 0.0f ? bright : dim);
+            items.push_back({ SLIDER, "", bright, 0.0f, 64.0f });
+            if (!sound_ready) text(opts.test ? "(sound is off in test mode)" : "(no audio device found)", dim);
+            gap(8.0f);
+            buttons = { { "Test sound", MenuAction::TestSound, sound_ready },
+                        { "Back", MenuAction::BackFromSound, true } };
+            hint = "Drag the slider or use Left/Right.  Esc: back";
         }
         else if (screen == Screen::Host) {
             text("Hosting on UDP port " + port, bright);
@@ -3270,14 +3758,15 @@ public:
             editable = !join_connecting && !join_connected;
             if (editable) {
                 for (char c : typed) {
-                    bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == '-';
+                    bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                           || c == '.' || c == '-' || c == ':';
                     if (ok && join_address.size() < 64) join_address.push_back(c);
                 }
                 for (int i = 0; i < backspaces && !join_address.empty(); i++) join_address.pop_back();
             }
             text("Host IP address:", bright);
             items.push_back({ INPUT, join_address, bright, 0.9f, 60.0f });
-            text("Port " + port + " (UDP)", dim);
+            text("UDP port " + port + ", or type address:port for another", dim);
             gap(6.0f);
             if (join_connected) {
                 text("Connected as " + capitalised(player_name(my_slot))
@@ -3301,6 +3790,17 @@ public:
         float ui = std::min((H - 24.0f) / total, (W - 32.0f) / std::max(widest, 440.0f));
         ui = std::clamp(ui, 0.35f, 1.3f);
 
+        double mx, my;
+        glfwGetCursorPos(window, &mx, &my);
+        int ww, wh;
+        glfwGetWindowSize(window, &ww, &wh);
+        if (ww > 0 && wh > 0) { mx *= static_cast<double>(screen_width) / ww; my *= static_cast<double>(screen_height) / wh; }
+        bool mouse_moved = mx != menu_last_mx || my != menu_last_my;
+        menu_last_mx = mx;
+        menu_last_my = my;
+        bool click = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+        if (!click) slider_dragging = false;
+
         // ---- Draw ------------------------------------------------------------------------------
         draw_quad(0.0f, 0.0f, W, H, { 0.02f, 0.02f, 0.04f, 0.80f });
         float y = std::max(8.0f, (H - total * ui) * 0.5f);
@@ -3317,17 +3817,21 @@ public:
                 bool caret = editable && std::fmod(glfwGetTime(), 1.0) < 0.5;
                 draw_text_centered(it.text + (caret ? "_" : " "), cx, top + 33.0f * ui, it.color, it.scale * ui);
             }
+            else if (it.kind == SLIDER) {
+                // Grab anywhere along the track (or near it) and drag; the knob follows.
+                float sw = std::min(420.0f * ui, W - 60.0f);
+                float left = cx - sw / 2, right = cx + sw / 2, mid = y + h * 0.5f;
+                bool over = mx >= left - 14.0f * ui && mx <= right + 14.0f * ui && my >= mid - 26.0f * ui && my <= mid + 26.0f * ui;
+                if (click && !click_prev && over) slider_dragging = true;
+                if (slider_dragging) set_volume(static_cast<float>((mx - left) / sw));
+                float kx = left + sw * master_volume, th = 5.0f * ui;
+                draw_quad(left, mid - th, right, mid + th, { 0.20f, 0.22f, 0.29f, 1.0f });
+                draw_quad(left, mid - th, kx, mid + th, gold);
+                draw_quad(kx - 9.0f * ui, mid - 18.0f * ui, kx + 9.0f * ui, mid + 18.0f * ui,
+                          slider_dragging || over ? gold : bright);
+            }
             y += h;
         }
-
-        double mx, my;
-        glfwGetCursorPos(window, &mx, &my);
-        int ww, wh;
-        glfwGetWindowSize(window, &ww, &wh);
-        if (ww > 0 && wh > 0) { mx *= static_cast<double>(screen_width) / ww; my *= static_cast<double>(screen_height) / wh; }
-        bool mouse_moved = mx != menu_last_mx || my != menu_last_my;
-        menu_last_mx = mx;
-        menu_last_my = my;
 
         int count = static_cast<int>(buttons.size());
         auto enabled_at = [&](int i) { return i >= 0 && i < count && buttons[i].enabled; };
@@ -3356,8 +3860,7 @@ public:
 
         // ---- Input, after drawing: an action may switch screens ---------------------------------
         MenuAction chosen = MenuAction::None;
-        bool click = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-        if (click && !click_prev) {
+        if (click && !click_prev && !slider_dragging) {
             for (int i = 0; i < count; i++) {
                 const glm::vec4& rc = rects[i];
                 if (buttons[i].enabled && mx >= rc.x && mx <= rc.z && my >= rc.y && my <= rc.w) chosen = buttons[i].action;
@@ -3377,54 +3880,6 @@ public:
         if (chosen != MenuAction::None) menu_action(chosen);
     }
 
-    // Other players are drawn as a small helmeted figure with a gun. It's generated here in
-    // grey and tinted per player when drawn, so it needs no image file.
-    GLuint create_player_texture() {
-        const int S = 128;
-        std::vector<unsigned char> px(static_cast<size_t>(S) * S * 4, 0);
-        // Shapes in image coordinates (y down). Each returns a grey level, or -1 for "outside".
-        auto shade_at = [](int x, int y) -> float {
-            auto in_rect = [&](int x0, int y0, int x1, int y1) { return x >= x0 && x <= x1 && y >= y0 && y <= y1; };
-            auto in_circle = [&](float cx, float cy, float r) { float dx = x - cx, dy = y - cy; return dx * dx + dy * dy <= r * r; };
-            if (in_rect(86, 58, 114, 66)) return 0.22f;          // gun barrel
-            if (in_rect(54, 22, 74, 31)) return 0.12f;           // visor
-            if (in_circle(64.0f, 30.0f, 14.0f)) return 0.92f;   // helmet
-            if (in_rect(48, 44, 80, 88)) return 0.85f;           // torso
-            if (in_rect(35, 46, 47, 82) || in_rect(81, 46, 93, 70)) return 0.72f; // arms
-            if (in_rect(50, 88, 62, 121) || in_rect(66, 88, 78, 121)) return 0.62f; // legs
-            return -1.0f;
-        };
-        std::vector<float> shade(static_cast<size_t>(S) * S);
-        for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) shade[static_cast<size_t>(y) * S + x] = shade_at(x, y);
-        for (int y = 0; y < S; y++) {
-            for (int x = 0; x < S; x++) {
-                float s = shade[static_cast<size_t>(y) * S + x];
-                bool outline = false;
-                if (s < 0.0f) { // a dark rim two pixels wide around the whole figure
-                    for (int dy = -2; dy <= 2 && !outline; dy++)
-                        for (int dx = -2; dx <= 2 && !outline; dx++) {
-                            int nx = x + dx, ny = y + dy;
-                            if (nx >= 0 && nx < S && ny >= 0 && ny < S && shade[static_cast<size_t>(ny) * S + nx] >= 0.0f) outline = true;
-                        }
-                }
-                // OpenGL's row 0 is the bottom of the image, so flip while writing.
-                unsigned char* p = &px[(static_cast<size_t>(S - 1 - y) * S + x) * 4];
-                if (s >= 0.0f) { p[0] = p[1] = p[2] = static_cast<unsigned char>(s * 255.0f); p[3] = 255; }
-                else if (outline) { p[0] = p[1] = p[2] = 20; p[3] = 255; }
-            }
-        }
-        GLuint tex;
-        glGenTextures(1, &tex);
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, S, S, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-        glGenerateMipmap(GL_TEXTURE_2D);
-        return tex;
-    }
-
     // Names over the other players' heads, only when you could actually see them.
     void render_labels() {
         if (mode == Mode::Single || !in_round || tab_view) return;
@@ -3442,7 +3897,7 @@ public:
             if (s == my_slot) continue;
             const RemotePlayer& r = remote[s];
             if (!r.present || !r.has_state || !r.alive) continue;
-            float head = static_cast<float>(floor_height(r.rx, r.ry, r.level) + r.jump) + 0.72f;
+            float head = static_cast<float>(floor_height(r.rx, r.ry, r.level) + r.jump) + 0.68f; // just over the helmet
             tags.push_back({ glm::vec3(static_cast<float>(r.rx), head, static_cast<float>(r.ry)), player_name(s), player_color(s), r.level });
         }
         if (beast_active() && my_slot != 3) {
@@ -3479,11 +3934,19 @@ public:
             draw_text_centered("Next maze in " + std::to_string(secs) + "...", cx, cy + 40.0f, { 0.85f, 0.85f, 0.9f, 1.0f }, 0.8f);
         }
         else if (showing_die) {
+            // Above the middle, out of the way of the view, but below the kill feed.
+            float top = screen_height * 0.30f;
+            const glm::vec4 hint_col = { 0.80f, 0.82f, 0.88f, 1.0f };
             draw_text_centered(killed_by == 0 ? std::string("You were killed by a monster")
-                                              : "You were killed by " + player_name(killed_by), cx, cy, { 1, 0.2f, 0.2f, 1 });
+                                              : "You were killed by " + player_name(killed_by), cx, top, { 1, 0.2f, 0.2f, 1 });
+            int secs = std::max(1, static_cast<int>(std::ceil(die_timer - glfwGetTime())));
+            draw_text_centered("Respawning in " + std::to_string(secs) + "...", cx, top + 40.0f, { 1, 1, 1, 1 }, 0.8f);
+            draw_text_centered("Spectating: fly with WASD and the mouse, Space up, Ctrl down", cx, top + 72.0f, hint_col, 0.6f);
         }
         else if (spectating) {
-            draw_text_centered("Your beast was defeated - spectating until the next maze", cx, cy, player_color(3), 0.8f);
+            float top = screen_height * 0.30f;
+            draw_text_centered("Your beast was defeated - spectating until the next maze", cx, top, player_color(3), 0.8f);
+            draw_text_centered("Fly with WASD and the mouse, Space up, Ctrl down", cx, top + 34.0f, { 0.80f, 0.82f, 0.88f, 1.0f }, 0.6f);
         }
         // Only in a real game: in a lobby the paused maze behind the menu isn't yours to exit.
         bool playing = mode == Mode::Single || in_round;
@@ -3554,7 +4017,7 @@ public:
                     }
                 }
 
-                if (!is_beast()) {
+                if (!is_beast() && !showing_die) { // a spectating ghost can't pick anything up
                     for (auto it = health_packs.begin(); it != health_packs.end(); ) {
                         if (it->level == player_level && std::hypot(it->x - player_pos_x, it->y - player_pos_y) < MEDPACK_PICKUP_RADIUS) {
                             player_hp = max_hp;
@@ -3602,9 +4065,14 @@ public:
 
                 if (!showing_die && player_hp <= 0 && !is_beast()) {
                     showing_die = true;
-                    die_timer = current_time + 1.5;
                     killed_by = last_damage_by;
-                    if (mode != Mode::Single) {
+                    if (mode == Mode::Single) {
+                        die_timer = current_time + 1.5;
+                    }
+                    else {
+                        // Multiplayer: a few seconds as a free camera before respawning.
+                        die_timer = current_time + RESPAWN_SECONDS;
+                        start_free_fly();
                         net::Writer w;
                         w.put<uint8_t>(MSG_DEATH).put<uint8_t>(round_id).put<uint8_t>(static_cast<uint8_t>(my_slot))
                          .put<uint8_t>(static_cast<uint8_t>(killed_by));
@@ -3644,7 +4112,8 @@ public:
             }
             else {
                 render_3d();
-                if (!is_beast()) render_viewmodel(); // the Beast is a boss, not someone holding a gun
+                // The Beast is a boss, not someone holding a gun; a spectator has no body at all.
+                if (!is_beast() && !free_fly) render_viewmodel();
                 render_minimap();
             }
 
@@ -3656,6 +4125,7 @@ public:
 
             typed.clear();
             backspaces = 0;
+            left_presses = right_presses = 0;
             if (net.active()) net.flush();
 
             if (!opts.screenshot.empty() && glfwWindowShouldClose(window)) save_screenshot(opts.screenshot);
@@ -3701,52 +4171,66 @@ public:
 
         double move_speed = 0.04182 * 60.0 * delta; // 15% slower again (was 0.0492)
         if (is_beast()) move_speed *= BEAST_SPEED;
-        if (!can_move) move_speed = 0.0;
 
-        // Facing-relative WASD in both 3D and Tab (matches look direction / green arrow)
-        double new_x = player_pos_x;
-        double new_y = player_pos_y;
-
-        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
-            new_x += dir_x * move_speed;
-            new_y += dir_y * move_speed;
+        if (free_fly) {
+            if (controls) fly(move_speed * 1.5);
         }
-        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-            new_x -= dir_x * move_speed;
-            new_y -= dir_y * move_speed;
-        }
-        // cross((dir_x,0,dir_y), (0,1,0)) = (-dir_y, 0, dir_x) — camera right
-        double strafe_x = -dir_y;
-        double strafe_y = dir_x;
-        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
-            new_x += strafe_x * move_speed;
-            new_y += strafe_y * move_speed;
-        }
-        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
-            new_x -= strafe_x * move_speed;
-            new_y -= strafe_y * move_speed;
-        }
+        else {
+            if (!can_move) move_speed = 0.0;
 
-        new_x = clip_position(new_x, player_pos_x, true);
-        new_y = clip_position(new_y, player_pos_y, false);
+            // Facing-relative WASD in both 3D and Tab (matches look direction / green arrow)
+            double new_x = player_pos_x;
+            double new_y = player_pos_y;
 
-        if (try_move(new_x, player_pos_y)) player_pos_x = new_x;
-        if (try_move(player_pos_x, new_y)) player_pos_y = new_y;
-        update_player_level(); // walking the staircase hands the player between the two levels
+            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
+                new_x += dir_x * move_speed;
+                new_y += dir_y * move_speed;
+            }
+            if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+                new_x -= dir_x * move_speed;
+                new_y -= dir_y * move_speed;
+            }
+            // cross((dir_x,0,dir_y), (0,1,0)) = (-dir_y, 0, dir_x) — camera right
+            double strafe_x = -dir_y;
+            double strafe_y = dir_x;
+            if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+                new_x += strafe_x * move_speed;
+                new_y += strafe_y * move_speed;
+            }
+            if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+                new_x -= strafe_x * move_speed;
+                new_y -= strafe_y * move_speed;
+            }
 
-        // Spacebar hops. Height is relative to the floor under you, so it behaves the same on
-        // the stairs and the lower level. Holding the key hops again each time you land.
-        bool grounded = jump_height <= 0.0 && jump_velocity <= 0.0;
-        // Bosses don't hop, so neither does the Beast.
-        if (grounded && can_move && !is_beast() && glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) jump_velocity = JUMP_SPEED;
-        if (!grounded || jump_velocity > 0.0) {
-            jump_velocity -= GRAVITY * delta;
-            jump_height += jump_velocity * delta;
-            if (jump_height <= 0.0) { jump_height = 0.0; jump_velocity = 0.0; }
+            new_x = clip_position(new_x, player_pos_x, true);
+            new_y = clip_position(new_y, player_pos_y, false);
+
+            if (try_move(new_x, player_pos_y)) player_pos_x = new_x;
+            if (try_move(player_pos_x, new_y)) player_pos_y = new_y;
+            update_player_level(); // walking the staircase hands the player between the two levels
+
+            // Spacebar hops. Height is relative to the floor under you, so it behaves the same on
+            // the stairs and the lower level. Holding the key hops again each time you land.
+            bool grounded = jump_height <= 0.0 && jump_velocity <= 0.0;
+            // Bosses don't hop, so neither does the Beast.
+            if (grounded && can_move && !is_beast() && glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) jump_velocity = JUMP_SPEED;
+            if (!grounded || jump_velocity > 0.0) {
+                jump_velocity -= GRAVITY * delta;
+                jump_height += jump_velocity * delta;
+                if (jump_height <= 0.0) { jump_height = 0.0; jump_velocity = 0.0; }
+            }
         }
 
         recoil = std::max(0.0, recoil - delta);
-        if (!controls) return; // menu open: no looking around or shooting
+        // Menu open: no looking around or shooting. Nor in a window that isn't in front: with
+        // two copies side by side the cursor keeps crossing the other one, and that mustn't
+        // swing its view around.
+        bool focused = glfwGetWindowAttrib(window, GLFW_FOCUSED) != 0;
+        if (!controls || !focused) {
+            first_mouse = true;
+            fire_pressed = true; // and the click that brings it back to the front won't fire
+            return;
+        }
 
         double xpos, ypos;
         glfwGetCursorPos(window, &xpos, &ypos);
@@ -3776,7 +4260,7 @@ public:
         // One shot per click: fire on the press edge only, so holding the button does nothing
         // until you release and click again. Rate of fire is now whatever your finger manages.
         bool fire_down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-        if (fire_down && !fire_pressed && can_move) {
+        if (fire_down && !fire_pressed && can_move && !showing_die && !free_fly) {
             if (is_beast()) beast_shoot();
             else {
                 shoot();
@@ -3791,7 +4275,7 @@ public:
         glm::mat4 projection = glm::perspective(glm::radians(60.0f), static_cast<float>(screen_width) / screen_height, 0.01f, 100.0f);  // no wall see-through when close
         glUniformMatrix4fv(glGetUniformLocation(shader_program, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
 
-        glm::vec3 camera_pos(static_cast<float>(player_pos_x), static_cast<float>(player_eye_y()), static_cast<float>(player_pos_y));
+        glm::vec3 camera_pos(static_cast<float>(player_pos_x), static_cast<float>(camera_y()), static_cast<float>(player_pos_y));
         float cp = std::cos(glm::radians(static_cast<float>(pitch)));
         float sp = std::sin(glm::radians(static_cast<float>(pitch)));
         glm::vec3 camera_front(static_cast<float>(dir_x) * cp, sp, static_cast<float>(dir_y) * cp);
@@ -3874,6 +4358,17 @@ public:
             glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
         }
 
+        // The other explorer, as a 3D soldier, flushing red for a moment when hurt. Solid, so
+        // drawn now with depth writes on; the see-through sprites below then sort against it.
+        for (int s = 1; s <= 2 && mode != Mode::Single; s++) {
+            if (s == my_slot) continue;
+            const RemotePlayer& r = remote[s];
+            if (!r.present || !r.has_state || !r.alive) continue;
+            double feet = floor_height(r.rx, r.ry, r.level) + r.jump;
+            glm::vec4 tint = glfwGetTime() < r.flash_until ? glm::vec4(1.8f, 0.4f, 0.4f, 1.0f) : glm::vec4(1.0f);
+            draw_player_model(r.rx, feet, r.ry, r.yaw, r.pitch, r.walk_phase, r.walk_amount, tint);
+        }
+
         std::vector<Sprite> sprites;
         for (const auto& m : monsters) {
             if (is_beast() && m.id == beast_boss_id) continue; // you are this one
@@ -3889,16 +4384,6 @@ public:
             float floor_y = h.level == 0 ? 0.0f : static_cast<float>(lower_floor_y);
             float centre_y = floor_y + MEDPACK_HALF_SIZE * (1.0f - 2.0f * medpack_bottom_margin) + 0.003f;
             sprites.emplace_back(Sprite{ glm::vec3(static_cast<float>(h.x), centre_y, static_cast<float>(h.y)), MEDPACK_HALF_SIZE, medpack_tex, {1,1,1,1}, true, 0.0 });
-        }
-        // The other explorer, in their colour, flashing red for a moment when hurt.
-        for (int s = 1; s <= 2 && mode != Mode::Single; s++) {
-            if (s == my_slot) continue;
-            const RemotePlayer& r = remote[s];
-            if (!r.present || !r.has_state || !r.alive) continue;
-            float feet = static_cast<float>(floor_height(r.rx, r.ry, r.level) + r.jump);
-            glm::vec4 tint = glfwGetTime() < r.flash_until ? glm::vec4(1.0f, 0.25f, 0.25f, 1.0f) : player_color(s);
-            sprites.emplace_back(Sprite{ glm::vec3(static_cast<float>(r.rx), feet + PLAYER_SPRITE_HALF - PLAYER_SPRITE_SINK + 0.003f,
-                                                   static_cast<float>(r.ry)), PLAYER_SPRITE_HALF, player_tex, tint, true, 0.0 });
         }
         for (const auto& p : projectiles) {
             glm::vec3 pp(static_cast<float>(p.x), static_cast<float>(p.z), static_cast<float>(p.y));
@@ -4299,8 +4784,12 @@ static LaunchOptions parse_args(int argc, char** argv) {
         else if (a.rfind("--quit-after", 0) == 0) o.quit_after = std::atof(value("--quit-after").c_str());
         else if (a == "--test") o.test = true;
         else if (a == "--test-fire") o.test_fire = true;
-        else if (a == "--test-spawn-near") o.test_spawn_near = true;
+        else if (a.rfind("--test-spawn-near", 0) == 0) {
+            o.test_spawn_near = true;
+            if (a.size() > 18 && a[17] == '=') o.test_spawn_yaw = std::atof(a.c_str() + 18);
+        }
         else if (a == "--open-menu") o.open_menu = true;
+        else if (a == "--open-menu=sound") { o.open_menu = true; o.open_sound = true; }
         else if (a.rfind("--screenshot", 0) == 0) o.screenshot = value("--screenshot");
         else std::cerr << "Unknown option: " << a << std::endl;
     }
