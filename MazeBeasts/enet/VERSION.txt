@@ -1,0 +1,7 @@
+ENet (https://github.com/lsalzman/enet), MIT License - see LICENSE in this folder.
+
+Vendored from commit 5a9c537fd464b3c6d3c55e1d3bd47588faf71b42 (master, 2026-06-23).
+That is 17 commits past the last tagged release (v1.3.18), picking up fixes to fragment
+handling, packet resizing and incoming-data accounting.
+
+Only the library sources and headers are included; build files, docs and tutorials are not.
