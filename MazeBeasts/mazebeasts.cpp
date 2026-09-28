@@ -371,10 +371,17 @@ private:
     static constexpr double PLAYER_HIT_RADIUS   = 0.16;
     static constexpr double PLAYER_HIT_HEIGHT   = 0.6;
 
+    // Crouching (hold Ctrl): the view drops by CROUCH_DROP over CROUCH_SECONDS, easing in and
+    // out, and comes back up just as fast. Crouched, you move at CROUCH_SPEED and present a
+    // smaller target; the soldier model bends its knees to match.
+    static constexpr double CROUCH_SECONDS      = 0.15;
+    static constexpr double CROUCH_DROP         = 0.18;       // eye height 0.5 -> 0.32
+    static constexpr double CROUCH_SPEED        = 0.55;       // times walking speed
+
     enum class Mode { Single, Host, Client };
-    enum class Screen { None, Main, Host, Join, Sound };
+    enum class Screen { None, Main, Host, Join, Sound, Controls };
     enum class MenuAction { None, Single, Join, Host, Sound, Exit, StartGame, CancelHost, Connect, BackFromJoin, BackFromSound,
-                            TestSound, RequestStart };
+                            TestSound, RequestStart, Controls, BackFromControls };
 
     struct RemotePlayer {
         bool present = false;    // in this game (lobby or round)
@@ -388,6 +395,19 @@ private:
         bool logged = false;     // first-position log line already written this round
         double walk_phase = 0;   // where the legs are in their stride
         double walk_amount = 0;  // 0 standing still .. 1 full stride, eased so legs settle
+        bool crouching = false;  // what they last reported
+        double crouch = 0;       // 0 standing .. 1 crouched, animated toward `crouching` here
+    };
+
+    // Where a vote for a new maze stands, as the host or server last described it (MSG_VOTE).
+    struct VoteView {
+        bool shown = false;
+        uint8_t id = 0;
+        int starter = 0;
+        uint8_t voters = 0, yes = 0, no = 0;
+        uint8_t state = VOTE_OPEN;
+        double ends_at = 0.0;    // local clock: when it expires, for the countdown
+        double hide_at = 0.0;    // once decided, the result shows until then
     };
 
     LaunchOptions opts;
@@ -410,6 +430,10 @@ private:
     // camera: it flies through walls and floors, and fly_y is its height.
     bool free_fly = false;
     double fly_y = 0.5;
+    bool crouching = false;      // Ctrl held (and allowed to crouch)
+    double crouch = 0.0;         // 0 standing .. 1 crouched, moving toward `crouching`
+    MapVote vote;                // host: the vote for a new maze, if one is running (rules in protocol.h)
+    VoteView vote_view;          // everyone: what to show of it
     int last_damage_by = 0;      // who hurt us last, so a death names the killer
     int killed_by = 0;
     bool exit_reported = false;
@@ -422,10 +446,12 @@ private:
     glm::mat4 last_proj = glm::mat4(1.0f), last_view = glm::mat4(1.0f); // for name labels
 
     // Other players' 3D figure: a soldier built in code (see build_player_model). Each part is
-    // its own mesh so it can turn about a joint: the legs stride, and the head and arms follow
-    // where the player is aiming. Faces carry baked light as vertex colours; only the
-    // camouflage trousers are textured, and their indices come first in each part.
-    enum PlayerPart { PART_BODY, PART_HEAD, PART_ARMS, PART_LEG_L, PART_LEG_R, PART_COUNT };
+    // its own mesh so it can turn about a joint: the legs stride and bend to crouch, and the
+    // head and arms follow where the player is aiming. Faces carry baked light as vertex
+    // colours; only the camouflage trousers are textured, and their indices come first in
+    // each part.
+    enum PlayerPart { PART_BODY, PART_HEAD, PART_ARMS,
+                      PART_THIGH_L, PART_SHIN_L, PART_BOOT_L, PART_THIGH_R, PART_SHIN_R, PART_BOOT_R, PART_COUNT };
     struct ModelPart {
         GLuint vao = 0, vbo = 0, ebo = 0;
         GLsizei textured = 0, plain = 0; // index counts
@@ -434,6 +460,7 @@ private:
     ModelPart player_parts[PART_COUNT];
     GLuint camo_tex = 0;
     static constexpr float PLAYER_MODEL_SCALE = 0.6f / 1.84f; // modelled 1.84 m tall, drawn 0.6
+    static constexpr float LEG_HIP_Y = 0.96f, LEG_KNEE_Y = 0.50f, LEG_ANKLE_Y = 0.10f; // leg joints, model metres
 
     // Menu UI state
     std::string menu_status;
@@ -456,6 +483,7 @@ private:
     // More key presses counted by the key callback and used up each frame, so nothing is
     // missed between frames and holding a key repeats where that makes sense.
     int enter_presses = 0, y_presses = 0, copy_presses = 0, paste_presses = 0;
+    int f1_presses = 0, f2_presses = 0; // vote Yes / No
     int up_presses = 0, down_presses = 0, page_up_presses = 0, page_down_presses = 0;
     int home_presses = 0, end_presses = 0;
     double wheel = 0.0;          // mouse wheel movement this frame (+ = away from you)
@@ -660,7 +688,18 @@ public:
     // between the two floors; everywhere else it is whichever floor the player is on.
     double floor_y_at(double x, double y) const { return floor_height(x, y, player_level); }
 
-    double player_eye_y() const { return floor_y_at(player_pos_x, player_pos_y) + 0.5 + jump_height; }
+    double player_eye_y() const { return floor_y_at(player_pos_x, player_pos_y) + 0.5 - CROUCH_DROP * eased(crouch) + jump_height; }
+
+    // Smooth start and stop for 0..1 transitions (crouching).
+    static double eased(double t) { t = std::clamp(t, 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+
+    // How much lower the top of a crouched soldier is: the model drops about as far as the view.
+    static double crouch_height_drop(double amount) { return 0.19 * eased(amount); }
+
+    void stand_up_now() {
+        crouching = false;
+        crouch = 0.0;
+    }
 
     // Where the camera is: your eyes, or the free camera while spectating.
     double camera_y() const { return free_fly ? fly_y : player_eye_y(); }
@@ -672,6 +711,7 @@ public:
         fly_y = player_eye_y();
         jump_height = 0.0;
         jump_velocity = 0.0;
+        stand_up_now(); // Ctrl flies down now
     }
 
     // The spectator camera: WASD moves along where you're looking (look down and press W to
@@ -843,7 +883,9 @@ public:
         case GLFW_KEY_END:       if (press) game->end_presses++; break;
         case GLFW_KEY_ENTER:
         case GLFW_KEY_KP_ENTER:  if (press) game->enter_presses++; break;
-        case GLFW_KEY_Y:         if (press && !ctrl) game->y_presses++; break;
+        case GLFW_KEY_Y:         if (press) game->y_presses++; break; // works while crouching (Ctrl) too
+        case GLFW_KEY_F1:        if (press) game->f1_presses++; break;
+        case GLFW_KEY_F2:        if (press) game->f2_presses++; break;
         case GLFW_KEY_C:         if (press && ctrl) game->copy_presses++; break;
         case GLFW_KEY_V:         if (ctrl) game->paste_presses++; break; // holding Ctrl+V pastes again, as in a text box
         default: break;
@@ -1141,6 +1183,7 @@ public:
         jump_height = 0.0;
         jump_velocity = 0.0;
         free_fly = false;
+        stand_up_now();
         player_hp = max_hp;
         damage_cooldown = 0;
         last_damage_by = 0;
@@ -1160,6 +1203,7 @@ public:
         player_level = 0;
         jump_height = 0.0;
         jump_velocity = 0.0;
+        stand_up_now();
         yaw = 0.0;
         pitch = 0.0;
         dir_x = 1.0;
@@ -1309,20 +1353,20 @@ public:
     int explorer_hit(int owner, int level, double x, double y, double z) {
         for (int s = 1; s <= 2; s++) {
             if (s == owner) continue;
-            double px, py, jump;
+            double px, py, jump, crouched;
             int lvl;
             if (s == my_slot) {
                 if (showing_die) continue;
-                px = player_pos_x; py = player_pos_y; lvl = player_level; jump = jump_height;
+                px = player_pos_x; py = player_pos_y; lvl = player_level; jump = jump_height; crouched = crouch;
             }
             else {
                 const RemotePlayer& r = remote[s];
                 if (!r.present || !r.has_state || !r.alive) continue;
-                px = r.rx; py = r.ry; lvl = r.level; jump = r.jump;
+                px = r.rx; py = r.ry; lvl = r.level; jump = r.jump; crouched = r.crouch;
             }
             if (lvl != level || std::hypot(px - x, py - y) > PLAYER_HIT_RADIUS) continue;
             double feet = floor_height(px, py, lvl) + jump;
-            if (z < feet - 0.05 || z > feet + PLAYER_HIT_HEIGHT) continue;
+            if (z < feet - 0.05 || z > feet + PLAYER_HIT_HEIGHT - crouch_height_drop(crouched)) continue; // crouching ducks
             return s;
         }
         return 0;
@@ -1906,14 +1950,21 @@ public:
             }
         };
 
-        // ---- Legs: boots, camouflage trousers and knee pads, each swinging from the hip.
+        // ---- Legs: camouflage trousers, knee pads and boots. Each leg is three parts so it can
+        // bend: the thigh swings from the hip, the shin bends at the knee, and the boot flexes
+        // at the ankle to stay flat on the floor.
         for (int side = 0; side < 2; side++) {
-            int part = side == 0 ? PART_LEG_L : PART_LEG_R;
             float x = side == 0 ? 0.105f : -0.105f;
-            upright(part, { x, 0.060f, 0.035f }, { 0.068f, 0.060f, 0.135f }, BOOT);
-            limb(part, { x, 0.11f, 0.0f }, { x, 0.52f, 0.0f }, 0.074f, 0.084f, WHITE, true); // shin
-            limb(part, { x, 0.50f, 0.0f }, { x, 0.96f, 0.0f }, 0.090f, 0.102f, WHITE, true); // thigh
-            upright(part, { x, 0.50f, 0.088f }, { 0.060f, 0.060f, 0.016f }, PAD);
+            int thigh = side == 0 ? PART_THIGH_L : PART_THIGH_R;
+            int shin = side == 0 ? PART_SHIN_L : PART_SHIN_R;
+            int boot = side == 0 ? PART_BOOT_L : PART_BOOT_R;
+            limb(thigh, { x, 0.50f, 0.0f }, { x, 0.96f, 0.0f }, 0.090f, 0.102f, WHITE, true);
+            limb(shin, { x, 0.11f, 0.0f }, { x, 0.52f, 0.0f }, 0.074f, 0.084f, WHITE, true);
+            upright(shin, { x, 0.50f, 0.088f }, { 0.060f, 0.060f, 0.016f }, PAD);
+            upright(boot, { x, 0.060f, 0.035f }, { 0.068f, 0.060f, 0.135f }, BOOT);
+            player_parts[thigh].pivot = { x, LEG_HIP_Y, 0.0f };
+            player_parts[shin].pivot = { x, LEG_KNEE_Y, 0.0f };
+            player_parts[boot].pivot = { x, LEG_ANKLE_Y, 0.0f };
         }
 
         // ---- Body: hips, belt, grey shirt, shoulders and neck.
@@ -1997,8 +2048,6 @@ public:
 
         player_parts[PART_HEAD].pivot = { 0.0f, 1.52f, 0.0f };
         player_parts[PART_ARMS].pivot = { 0.0f, 1.42f, 0.0f };
-        player_parts[PART_LEG_L].pivot = { 0.105f, 0.95f, 0.0f };
-        player_parts[PART_LEG_R].pivot = { -0.105f, 0.95f, 0.0f };
 
         for (int i = 0; i < PART_COUNT; i++) {
             const Build& b = parts[i];
@@ -2031,28 +2080,56 @@ public:
     }
 
     // One soldier standing at (x, feet height, y), facing along yaw, with the head and rifle
-    // following the pitch and the legs mid-stride. The tint is multiplied over everything.
+    // following the pitch, the legs mid-stride, and `crouch` (0..1, already eased) bending the
+    // knees. The tint is multiplied over everything.
     void draw_player_model(double x, double feet, double y, double yaw_deg, double pitch_deg,
-                           double walk_phase, double walk_amount, glm::vec4 tint) {
+                           double walk_phase, double walk_amount, double crouch_amount, glm::vec4 tint) {
         // The model faces +Z; turn that onto the heading (cos yaw, sin yaw) in the maze.
         float yaw_r = glm::radians(static_cast<float>(yaw_deg));
         glm::mat4 base = glm::translate(glm::mat4(1.0f), glm::vec3(static_cast<float>(x), static_cast<float>(feet), static_cast<float>(y)));
         base = glm::rotate(base, std::atan2(std::cos(yaw_r), std::sin(yaw_r)), glm::vec3(0.0f, 1.0f, 0.0f));
         base = glm::scale(base, glm::vec3(PLAYER_MODEL_SCALE));
 
-        // Turning about +X by a negative angle tips the front (+Z) upward.
+        // Turning about +X by a negative angle tips the front (+Z) upward - or, for a leg,
+        // swings the knee forward.
+        auto turn = [](const glm::mat4& m, glm::vec3 pivot, float angle) {
+            if (angle == 0.0f) return m;
+            return glm::translate(m, pivot) * glm::rotate(glm::mat4(1.0f), angle, glm::vec3(1.0f, 0.0f, 0.0f))
+                 * glm::translate(glm::mat4(1.0f), -pivot);
+        };
         float aim = glm::radians(std::clamp(static_cast<float>(pitch_deg), -60.0f, 60.0f));
         float swing = glm::radians(34.0f) * static_cast<float>(walk_amount) * std::sin(static_cast<float>(walk_phase));
-        const float angle[PART_COUNT] = { 0.0f, -aim * 0.6f, -aim, swing, -swing };
+
+        // Crouching: the thighs come forward (to 75 degrees) and the shins lean back (to 60), so
+        // the hips drop; the boots stay flat. Everything above the hips drops with them and tips
+        // forward a little, while the whole figure shifts back so the feet stay where they were.
+        const float c = static_cast<float>(crouch_amount);
+        const float thigh_a = glm::radians(75.0f) * c, shin_a = glm::radians(60.0f) * c;
+        const float thigh_len = LEG_HIP_Y - LEG_KNEE_Y, shin_len = LEG_KNEE_Y - LEG_ANKLE_Y;
+        const float drop = LEG_HIP_Y - (LEG_ANKLE_Y + thigh_len * std::cos(thigh_a) + shin_len * std::cos(shin_a));
+        const float ankle_ahead = thigh_len * std::sin(thigh_a) - shin_len * std::sin(shin_a);
+        const glm::mat4 hips = glm::translate(base, glm::vec3(0.0f, -drop, -ankle_ahead));
+        const float lean = glm::radians(20.0f) * c;
+        const glm::mat4 upper = turn(hips, glm::vec3(0.0f, LEG_HIP_Y, 0.0f), lean);
+
+        glm::mat4 mats[PART_COUNT];
+        mats[PART_BODY] = upper;
+        mats[PART_HEAD] = turn(upper, player_parts[PART_HEAD].pivot, -aim * 0.6f - lean); // still looking ahead
+        mats[PART_ARMS] = turn(upper, player_parts[PART_ARMS].pivot, -aim - lean);        // still aiming where they aim
+        const int legs[2][3] = { { PART_THIGH_L, PART_SHIN_L, PART_BOOT_L }, { PART_THIGH_R, PART_SHIN_R, PART_BOOT_R } };
+        for (int side = 0; side < 2; side++) {
+            const int* leg = legs[side];
+            float leg_swing = side == 0 ? swing : -swing;
+            mats[leg[0]] = turn(hips, player_parts[leg[0]].pivot, -thigh_a + leg_swing);
+            mats[leg[1]] = turn(mats[leg[0]], player_parts[leg[1]].pivot, thigh_a + shin_a); // knee: shin ends up leaning back
+            mats[leg[2]] = turn(mats[leg[1]], player_parts[leg[2]].pivot, -shin_a);           // ankle: boot level again
+        }
 
         glUniform4f(glGetUniformLocation(shader_program, "color"), tint.r, tint.g, tint.b, tint.a);
         glBindTexture(GL_TEXTURE_2D, camo_tex);
         for (int i = 0; i < PART_COUNT; i++) {
             const ModelPart& p = player_parts[i];
-            glm::mat4 m = base;
-            if (angle[i] != 0.0f)
-                m = glm::translate(m, p.pivot) * glm::rotate(glm::mat4(1.0f), angle[i], glm::vec3(1.0f, 0.0f, 0.0f))
-                  * glm::translate(glm::mat4(1.0f), -p.pivot);
+            const glm::mat4& m = mats[i];
             glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(m));
             glBindVertexArray(p.vao);
             if (p.textured) {
@@ -2379,7 +2456,7 @@ public:
     }
 
     void send_state() {
-        uint8_t flags = (!showing_die && !spectating) ? 1 : 0; // bit 0: alive
+        uint8_t flags = static_cast<uint8_t>(((!showing_die && !spectating) ? STATE_ALIVE : 0) | (crouching ? STATE_CROUCHING : 0));
         net::Writer w;
         w.put<uint8_t>(MSG_STATE).put<uint8_t>(round_id).put<uint8_t>(static_cast<uint8_t>(my_slot))
          .put<uint8_t>(static_cast<uint8_t>(player_level)).put<uint8_t>(flags)
@@ -2417,6 +2494,110 @@ public:
         net::Writer w;
         w.put<uint8_t>(MSG_LOBBY).put<uint8_t>(lobby_mask);
         net.broadcast(w.buf, true);
+    }
+
+    // ---- Voting for a new maze ------------------------------------------------------------
+    // Whoever runs the game (here, when hosting; otherwise the host's game or the dedicated
+    // server) keeps the vote with the shared rules in protocol.h. Everyone else asks, votes,
+    // and shows what they're told.
+
+    // F8, or "votemap" in chat.
+    void request_vote() {
+        if (!in_round) return;
+        if (mode == Mode::Host) host_vote_start(my_slot);
+        else if (mode == Mode::Client) {
+            net::Writer w;
+            w.put<uint8_t>(MSG_VOTE_START);
+            net.send_to_host(w.buf, true);
+        }
+    }
+
+    // F1 (Yes) or F2 (No), if there's a vote you can still vote in.
+    void cast_vote(bool yes) {
+        uint8_t me = static_cast<uint8_t>(1 << my_slot);
+        const VoteView& v = vote_view;
+        if (!v.shown || v.state != VOTE_OPEN || !(v.voters & me) || ((v.yes | v.no) & me)) return;
+        if (mode == Mode::Host) {
+            host_vote_cast(my_slot, yes);
+            return;
+        }
+        net::Writer w;
+        w.put<uint8_t>(MSG_VOTE_CAST).put<uint8_t>(yes ? 1 : 0);
+        net.send_to_host(w.buf, true);
+        if (yes) vote_view.yes |= me; else vote_view.no |= me; // shown at once; the next MSG_VOTE confirms it
+    }
+
+    // What the vote panel shows: from MSG_VOTE, or the host's own copy of it.
+    void on_vote(uint8_t id, int starter, uint8_t voters, uint8_t yes, uint8_t no, uint8_t state, double seconds_left) {
+        double now = glfwGetTime();
+        vote_view.shown = true;
+        vote_view.id = id;
+        vote_view.starter = starter;
+        vote_view.voters = voters;
+        vote_view.yes = yes;
+        vote_view.no = no;
+        vote_view.state = state;
+        vote_view.ends_at = now + seconds_left;
+        if (state != VOTE_OPEN) vote_view.hide_at = now + 3.0; // the result stays up briefly
+    }
+
+    // A line from the game itself, "Game: ...": to everyone, or to one player.
+    void game_notice(const std::string& text) {
+        add_chat(0, text);
+        net::Writer w;
+        w.put<uint8_t>(MSG_CHAT).put<uint8_t>(0).put_text(text);
+        net.broadcast(w.buf, true);
+    }
+
+    void game_notice_to(int slot, const std::string& text) {
+        if (slot == my_slot) { add_chat(0, text); return; }
+        if (slot < 1 || slot > 3 || slot_peer[slot] < 0) return;
+        net::Writer w;
+        w.put<uint8_t>(MSG_CHAT).put<uint8_t>(0).put_text(text);
+        net.send(slot_peer[slot], w.buf, true);
+    }
+
+    void host_broadcast_vote(VoteState state) {
+        double left = vote.seconds_left(glfwGetTime());
+        net::Writer w;
+        w.put<uint8_t>(MSG_VOTE).put<uint8_t>(vote.id).put<uint8_t>(static_cast<uint8_t>(vote.starter))
+         .put<uint8_t>(vote.voters).put<uint8_t>(vote.yes).put<uint8_t>(vote.no).put<uint8_t>(state)
+         .put<uint16_t>(static_cast<uint16_t>(std::min(65000.0, left * 1000.0)));
+        net.broadcast(w.buf, true);
+        on_vote(vote.id, vote.starter, vote.voters, vote.yes, vote.no, state, left);
+    }
+
+    void host_vote_start(int slot) {
+        if (!in_round || round_over) { game_notice_to(slot, "Votes can only be started during a maze."); return; }
+        int r = vote.start(slot, lobby_mask, glfwGetTime());
+        if (r == -1) { game_notice_to(slot, "A vote is already running: F1 = Yes, F2 = No."); return; }
+        if (r > 0) {
+            game_notice_to(slot, "Nobody answered your last " + std::to_string(VOTE_SOLO_LIMIT)
+                                 + " votes. You can start another in " + minutes_seconds(r) + ".");
+            return;
+        }
+        game_notice(capitalised(player_name(slot)) + " started a vote for a new maze: F1 = Yes, F2 = No");
+        host_broadcast_vote(VOTE_OPEN);
+        host_settle_vote();
+    }
+
+    void host_vote_cast(int slot, bool yes) {
+        if (!in_round || !vote.cast(slot, yes)) return;
+        host_broadcast_vote(VOTE_OPEN);
+        host_settle_vote();
+    }
+
+    // Every frame while hosting, and after each change: pass, fail or expire once decided.
+    void host_settle_vote() {
+        if (!vote.active) return;
+        VoteState state = vote.check(glfwGetTime());
+        if (state == VOTE_OPEN) return;
+        host_broadcast_vote(state);
+        if (state == VOTE_PASSED) {
+            game_notice("Vote passed: here's a new maze!");
+            host_start_round();
+        }
+        else game_notice(state == VOTE_FAILED ? "Vote failed: no new maze." : "Vote expired: not enough players voted.");
     }
 
     // ---- Receiving --------------------------------------------------------------------------
@@ -2470,6 +2651,7 @@ public:
         slot_peer[slot] = -1;
         remote[slot] = RemotePlayer{};
         lobby_mask = static_cast<uint8_t>(lobby_mask & ~(1 << slot));
+        vote.remove_player(slot); // a running vote is settled without them
         log("[net] player " + std::to_string(slot) + " left");
         if (in_round) {
             add_feed(capitalised(player_name(slot)) + " left the game");
@@ -2512,10 +2694,12 @@ public:
         y = std::clamp(y, 0.0f, static_cast<float>(grid_size) - 0.001f);
         RemotePlayer& p = remote[slot];
         bool teleport = !p.has_state || (level != 0) != (p.level != 0) || std::hypot(x - p.x, y - p.y) > 2.0;
-        bool alive = (flags & 1) != 0;
+        bool alive = (flags & STATE_ALIVE) != 0;
         if (p.has_state && alive && hp < p.hp) p.flash_until = glfwGetTime() + 0.15;
         p.x = x; p.y = y;
         if (teleport) { p.rx = x; p.ry = y; }
+        p.crouching = (flags & STATE_CROUCHING) != 0; // animated toward in smooth_remote_players
+        if (teleport) p.crouch = p.crouching ? 1.0 : 0.0;
         p.jump = std::clamp(jump, 0.0f, 1.0f);
         p.yaw = yw; p.pitch = pt;
         p.level = level != 0 ? 1 : 0;
@@ -2642,6 +2826,12 @@ public:
             net.broadcast(w.buf, true, peer);
             return;
         }
+        if (type == MSG_VOTE_START) { host_vote_start(slot); return; }
+        if (type == MSG_VOTE_CAST) {
+            uint8_t choice = r.get<uint8_t>();
+            if (r.ok) host_vote_cast(slot, choice != 0);
+            return;
+        }
         uint8_t rnd = r.get<uint8_t>();
         if (!r.ok || !in_round || rnd != round_id) return; // from a previous maze, or no round yet
 
@@ -2730,9 +2920,17 @@ public:
             return;
         }
         case MSG_CHAT: {
-            int from = r.get<uint8_t>();
+            int from = r.get<uint8_t>(); // 0: the host or server's own notices
             std::string text = trim_spaces(clean_chat_text(r.get_text()));
-            if (r.ok && from >= 1 && from <= 3 && !text.empty()) add_chat(from, text);
+            if (r.ok && from <= 3 && !text.empty()) add_chat(from, text);
+            return;
+        }
+        case MSG_VOTE: {
+            uint8_t id = r.get<uint8_t>();
+            int starter = r.get<uint8_t>();
+            uint8_t voters = r.get<uint8_t>(), yes = r.get<uint8_t>(), no = r.get<uint8_t>(), state = r.get<uint8_t>();
+            int ms = r.get<uint16_t>();
+            if (r.ok && in_round && state <= VOTE_EXPIRED) on_vote(id, starter, voters, yes, no, state, ms / 1000.0);
             return;
         }
         case MSG_TO_LOBBY: {
@@ -2843,6 +3041,8 @@ public:
         round_id = 0;
         for (auto& p : remote) p = RemotePlayer{};
         for (int& p : slot_peer) p = -1;
+        vote = MapVote{};
+        vote_view = VoteView{};
         round_seed = random_seed(); // shown in the lobby; the first round uses it
         host_ips = net.local_ipv4_addresses();
         menu_status.clear();
@@ -2885,6 +3085,7 @@ public:
         join_port = port;
         mode = Mode::Client;
         in_round = false;
+        vote_view = VoteView{};
         join_connecting = true;
         join_connected = false;
         lobby_mask = 1 << 1;
@@ -2913,6 +3114,8 @@ public:
         for (auto& p : remote) p = RemotePlayer{};
         for (int& p : slot_peer) p = -1;
         feed.clear();
+        vote = MapVote{};
+        vote_view = VoteView{};
         mp_maze = false;
         if (had_round) new_maze(random_seed(), true);
         glfwSetWindowTitle(window, "MazeBeasts - 3D");
@@ -2923,6 +3126,7 @@ public:
 
     void host_start_round() {
         if (mode != Mode::Host) return;
+        vote.cancel(); // a new maze makes any vote moot
         if (round_id > 0) round_seed = random_seed(); // later rounds get a fresh maze
         round_id++;
         new_maze(round_seed, true);
@@ -2945,6 +3149,7 @@ public:
         mp_maze = true;
         joined_in_progress = false;
         menu_status.clear();
+        if (vote_view.state == VOTE_OPEN) vote_view.shown = false; // a passed vote's result stays up a moment
         round_over = false;
         round_winner = 0;
         exit_reported = false;
@@ -3028,6 +3233,9 @@ public:
             if (r.jump > 0.02) stride = 0.0; // legs together in the air
             r.walk_amount += (stride - r.walk_amount) * std::min(1.0, delta * 8.0);
             r.walk_phase = std::fmod(r.walk_phase + moved * glm::two_pi<double>() / 0.62, glm::two_pi<double>());
+            // Crouching and standing take the same time as they do for the player doing it.
+            double step = delta / CROUCH_SECONDS;
+            r.crouch = r.crouching ? std::min(1.0, r.crouch + step) : std::max(0.0, r.crouch - step);
         }
     }
 
@@ -3064,8 +3272,10 @@ public:
 
     bool note_showing() const { return !note.empty() && glfwGetTime() < note_until; }
 
+    // Slot 0 is the game itself: notices about votes and the like.
     std::string chat_sender(int from) const {
-        if (mode == Mode::Single || from < 1 || from > 3) return "You";
+        if (from < 1 || from > 3) return "Game";
+        if (mode == Mode::Single) return "You";
         return capitalised(player_name(from));
     }
 
@@ -3085,13 +3295,21 @@ public:
             chat_draft += clean_chat_text(text, CHAT_MAX_CHARS - chat_draft.size());
     }
 
-    // Enter on the chat line: send it (unless it's blank) and close the line.
+    // Enter on the chat line: send it (unless it's blank) and close the line. "votemap" isn't
+    // said out loud: it asks for a vote on a new maze (in singleplayer, it just makes one).
     void submit_chat() {
         std::string text = trim_spaces(clean_chat_text(chat_draft));
         chat_open = false;
         chat_draft.clear();
         if (text.empty()) return;
-        add_chat(mode == Mode::Single ? 0 : my_slot, text);
+        std::string command = text;
+        for (char& c : command) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (command == "votemap" || command == "/votemap") {
+            if (mode == Mode::Single) regenerate_maze();
+            else request_vote();
+            return;
+        }
+        add_chat(my_slot, text);
         net::Writer w;
         if (mode == Mode::Host) {
             w.put<uint8_t>(MSG_CHAT).put<uint8_t>(static_cast<uint8_t>(my_slot)).put_text(text);
@@ -3201,6 +3419,7 @@ public:
             case Screen::Host: menu_action(MenuAction::CancelHost); break;
             case Screen::Join: menu_action(MenuAction::BackFromJoin); break;
             case Screen::Sound: menu_action(MenuAction::BackFromSound); break;
+            case Screen::Controls: menu_action(MenuAction::BackFromControls); break;
             }
         }
         esc_pressed = down;
@@ -3233,6 +3452,14 @@ public:
             if (volume_dirty) save_settings();
             open_menu(Screen::Main);
             menu_focus = 3; // back on the Sound button
+            break;
+        case MenuAction::Controls:
+            // Just a page to read: it doesn't leave a multiplayer game either.
+            open_menu(Screen::Controls);
+            break;
+        case MenuAction::BackFromControls:
+            open_menu(Screen::Main);
+            menu_focus = 4; // back on the Controls button
             break;
         case MenuAction::TestSound:
             play_sound("monster_sound.flac");
@@ -3291,12 +3518,14 @@ public:
         const std::string port = std::to_string(net::DEFAULT_PORT);
 
         // ---- Describe the page -------------------------------------------------------------
-        enum ItemKind { TEXT, INPUT, SLIDER, GAP };
-        struct Item { ItemKind kind; std::string text; glm::vec4 color; float scale; float height; };
+        enum ItemKind { TEXT, INPUT, SLIDER, KEYROW, GAP };
+        struct Item { ItemKind kind; std::string text; glm::vec4 color; float scale; float height; std::string text2; };
         std::vector<Item> items;
-        auto text = [&](const std::string& s, glm::vec4 c) { items.push_back({ TEXT, s, c, 0.75f, 32.0f }); };
-        auto gap = [&](float h) { items.push_back({ GAP, "", {}, 0.0f, h }); };
-        items.push_back({ TEXT, "MAZE BEASTS", gold, 1.6f, 76.0f });
+        auto text = [&](const std::string& s, glm::vec4 c) { items.push_back({ TEXT, s, c, 0.75f, 32.0f, "" }); };
+        auto gap = [&](float h) { items.push_back({ GAP, "", {}, 0.0f, h, "" }); };
+        // A key and what it does, in two columns.
+        auto keyrow = [&](const std::string& key, const std::string& action) { items.push_back({ KEYROW, key, gold, 0.64f, 27.0f, action }); };
+        items.push_back({ TEXT, "MAZE BEASTS", gold, 1.6f, 76.0f, "" });
 
         std::vector<Button> buttons;
         std::string hint;
@@ -3307,9 +3536,32 @@ public:
                         { "Multiplayer - Join", MenuAction::Join, true },
                         { "Multiplayer - Host", MenuAction::Host, true },
                         { "Sound", MenuAction::Sound, true },
+                        { "Controls", MenuAction::Controls, true },
                         { "Exit", MenuAction::Exit, true } };
             hint = mode == Mode::Single ? "Esc: back to the game"
                                         : "Esc: back to the game.  Singleplayer, Join or Host leave this match.";
+        }
+        else if (screen == Screen::Controls) {
+            text("Controls", bright);
+            gap(4.0f);
+            keyrow("W A S D", "Move");
+            keyrow("Mouse", "Look and aim");
+            keyrow("Left click", "Shoot");
+            keyrow("Spacebar", "Jump");
+            keyrow("Ctrl (hold)", "Crouch");
+            keyrow("Tab", "Show the whole maze");
+            keyrow("Esc", "Menu");
+            keyrow("Enter", "Chat: type, then Enter again to send");
+            keyrow("Y", "Chat log");
+            keyrow("Ctrl+C / Ctrl+V", "Copy / paste (chat, and the Join address)");
+            keyrow("F8", "New maze (singleplayer)");
+            keyrow("F8 or chat: votemap", "Start a vote for a new maze (multiplayer)");
+            keyrow("F1 / F2", "Vote Yes / No");
+            keyrow("F5", "Developer mode (singleplayer only)");
+            gap(6.0f);
+            items.push_back({ TEXT, "Spectating: fly with W A S D and the mouse, Spacebar up, Ctrl down", dim, 0.6f, 28.0f, "" });
+            buttons = { { "Back", MenuAction::BackFromControls, true } };
+            hint = "Esc: back";
         }
         else if (screen == Screen::Sound) {
             for (int i = 0; i < left_presses; i++) set_volume(master_volume - 0.05f);
@@ -3413,7 +3665,15 @@ public:
         float total = hint_h;
         for (const auto& it : items) total += it.height;
         total += buttons.size() * (button_h + button_gap);
-        float widest = 0.0f;
+        // Key rows line up in two columns: keys right-aligned against a gap, what they do after it.
+        const float key_gap = 22.0f;
+        float key_col = 0.0f, action_col = 0.0f;
+        for (const auto& it : items) {
+            if (it.kind != KEYROW) continue;
+            key_col = std::max(key_col, text_width(it.text, it.scale));
+            action_col = std::max(action_col, text_width(it.text2, it.scale));
+        }
+        float widest = key_col > 0.0f ? key_col + key_gap + action_col : 0.0f;
         for (const auto& it : items) if (it.kind == TEXT) widest = std::max(widest, text_width(it.text, it.scale));
         float ui = std::min((H - 24.0f) / total, (W - 32.0f) / std::max(widest, 440.0f));
         ui = std::clamp(ui, 0.35f, 1.3f);
@@ -3436,6 +3696,13 @@ public:
             float h = it.height * ui;
             if (it.kind == TEXT && !it.text.empty()) {
                 draw_text_centered(it.text, cx, y + h * 0.72f, it.color, it.scale * ui);
+            }
+            else if (it.kind == KEYROW) {
+                float left = cx - (key_col + key_gap + action_col) * ui * 0.5f;
+                float split = left + key_col * ui;
+                float base = y + h * 0.72f;
+                draw_text(it.text, split - text_width(it.text, it.scale * ui), base, it.color, it.scale * ui);
+                draw_text(it.text2, split + key_gap * ui, base, bright, it.scale * ui);
             }
             else if (it.kind == INPUT) {
                 float bw = std::min(460.0f * ui, W - 40.0f);
@@ -3483,7 +3750,7 @@ public:
             y += bh + button_gap * ui;
         }
         if (!hint.empty()) draw_text_centered(hint, cx, y + 22.0f * ui, dim, 0.6f * ui);
-        const std::string version = "v0.41";
+        const std::string version = "v0.42";
         const float vs = 0.55f * std::max(ui, 0.6f);
         draw_text(version, W - text_width(version, vs) - 12.0f, H - 10.0f, { 0.45f, 0.45f, 0.52f, 1.0f }, vs);
         glEnable(GL_DEPTH_TEST);
@@ -3527,7 +3794,7 @@ public:
             if (s == my_slot) continue;
             const RemotePlayer& r = remote[s];
             if (!r.present || !r.has_state || !r.alive) continue;
-            float head = static_cast<float>(floor_height(r.rx, r.ry, r.level) + r.jump) + 0.68f; // just over the helmet
+            float head = static_cast<float>(floor_height(r.rx, r.ry, r.level) + r.jump + 0.68 - crouch_height_drop(r.crouch)); // just over the helmet
             tags.push_back({ glm::vec3(static_cast<float>(r.rx), head, static_cast<float>(r.ry)), player_name(s), player_color(s), r.level });
         }
         if (beast_active() && my_slot != 3) {
@@ -3587,6 +3854,70 @@ public:
             if (at_exit && bosses > 0) {
                 std::string msg = "Exit locked: " + std::to_string(bosses) + (bosses == 1 ? " boss remaining" : " bosses remaining");
                 draw_text_centered(msg, cx, cy, { 1.0f, 0.3f, 0.3f, 1.0f });
+            }
+        }
+        glEnable(GL_DEPTH_TEST);
+    }
+
+    // ---- The vote panel -------------------------------------------------------------------------
+    // Under the minimap on the left: what's being voted on, the countdown, how to vote, and
+    // each player's answer so far. Once decided, the result stays up for a few seconds.
+    void render_vote() {
+        if (mode == Mode::Single || !in_round || screen != Screen::None || !vote_view.shown) return;
+        const double now = glfwGetTime();
+        const VoteView& v = vote_view;
+        bool open = v.state == VOTE_OPEN;
+        if (!open && now >= v.hide_at) return;
+
+        glViewport(0, 0, screen_width, screen_height);
+        glm::mat4 projection = glm::ortho(0.0f, static_cast<float>(screen_width), static_cast<float>(screen_height), 0.0f, -1.0f, 1.0f);
+        glm::mat4 id = glm::mat4(1.0f);
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "view"), 1, GL_FALSE, glm::value_ptr(id));
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(id));
+        glDisable(GL_DEPTH_TEST);
+
+        const glm::vec4 white = { 1.0f, 1.0f, 1.0f, 1.0f }, dim = { 0.70f, 0.74f, 0.82f, 1.0f };
+        const glm::vec4 gold = { 0.95f, 0.78f, 0.30f, 1.0f }, green = { 0.45f, 1.0f, 0.55f, 1.0f }, red = { 1.0f, 0.45f, 0.40f, 1.0f };
+        struct Line { std::string text; glm::vec4 color; std::string right; };
+        std::vector<Line> lines;
+        uint8_t me = static_cast<uint8_t>(1 << my_slot);
+        if (open) {
+            int secs = std::max(0, static_cast<int>(std::ceil(v.ends_at - now)));
+            lines.push_back({ "New maze?", gold, std::to_string(secs) + "s" });
+            lines.push_back({ "Asked by " + player_name(v.starter), dim, "" });
+            if (!(v.voters & me)) lines.push_back({ "(you'll vote from the next maze)", dim, "" });
+            else if (v.yes & me) lines.push_back({ "You voted Yes", green, "" });
+            else if (v.no & me) lines.push_back({ "You voted No", red, "" });
+            else lines.push_back({ "F1 = Yes      F2 = No", white, "" });
+            for (int s = 1; s <= 3; s++) {
+                uint8_t b = static_cast<uint8_t>(1 << s);
+                if (!(v.voters & b)) continue;
+                bool y = (v.yes & b) != 0, n = (v.no & b) != 0;
+                lines.push_back({ capitalised(player_name(s)) + ":", player_color(s), y ? "Yes" : n ? "No" : "..." });
+            }
+        }
+        else {
+            lines.push_back({ v.state == VOTE_PASSED ? "Vote passed: new maze!" : v.state == VOTE_FAILED ? "Vote failed" : "Vote expired",
+                              v.state == VOTE_PASSED ? green : v.state == VOTE_FAILED ? red : dim, "" });
+        }
+
+        const float s = chat_scale() * 1.05f, line_h = 34.0f * s, pad = 10.0f * s, ascent = 27.0f * s;
+        const int mini = std::max(64, std::min(screen_width, screen_height) / 5); // as render_minimap sizes it
+        const float x = 16.0f, y = 16.0f + mini + 12.0f;
+        float w = 0.0f;
+        for (const auto& l : lines) w = std::max(w, text_width(l.text, s) + (l.right.empty() ? 0.0f : 28.0f * s + text_width(l.right, s)));
+        w = std::max(w + 2.0f * pad, 200.0f * s);
+        float h = lines.size() * line_h + 2.0f * pad;
+        draw_quad(x - 2.0f, y - 2.0f, x + w + 2.0f, y + h + 2.0f, open ? gold : faded(gold, 0.5f));
+        draw_quad(x, y, x + w, y + h, { 0.04f, 0.05f, 0.08f, 0.88f });
+        for (size_t i = 0; i < lines.size(); i++) {
+            const Line& l = lines[i];
+            float base = y + pad + i * line_h + ascent;
+            draw_text(l.text, x + pad, base, l.color, s);
+            if (!l.right.empty()) {
+                glm::vec4 rc = l.right == "Yes" ? green : l.right == "No" ? red : i == 0 ? white : dim;
+                draw_text(l.right, x + w - pad - text_width(l.right, s), base, rc, s);
             }
         }
         glEnable(GL_DEPTH_TEST);
@@ -3738,7 +4069,8 @@ public:
     }
 
     glm::vec4 player_color_of_sender(const ChatMessage& m) const {
-        return m.from >= 1 && m.from <= 3 && mode != Mode::Single ? player_color(m.from) : glm::vec4(0.40f, 1.00f, 0.50f, 1.0f);
+        if (m.from < 1 || m.from > 3) return { 0.95f, 0.78f, 0.30f, 1.0f }; // the game's own notices, in gold
+        return mode != Mode::Single ? player_color(m.from) : glm::vec4(0.40f, 1.00f, 0.50f, 1.0f);
     }
 
     // The Y window: everything said since the game started, newest at the bottom. Up/Down
@@ -3850,6 +4182,7 @@ public:
             handle_escape();
             pump_network();
             update_chat(delta);
+            if (mode == Mode::Host && in_round) host_settle_vote(); // votes expire on the clock
             if (mode == Mode::Host && !in_round && opts.autostart > 0 && (lobby_mask & (1 << 2))
                 && player_count() >= opts.autostart)
                 host_start_round();
@@ -3993,6 +4326,7 @@ public:
             render_hud(hud_bosses);
             render_labels();
             render_center_message(hud_bosses);
+            render_vote();
             render_chat();
             if (screen != Screen::None) render_menu();
 
@@ -4001,6 +4335,7 @@ public:
             backspaces = 0;
             left_presses = right_presses = 0;
             enter_presses = y_presses = copy_presses = paste_presses = 0;
+            f1_presses = f2_presses = 0;
             up_presses = down_presses = page_up_presses = page_down_presses = 0;
             home_presses = end_presses = 0;
             wheel = 0.0;
@@ -4021,20 +4356,25 @@ public:
         bool keys = controls && !chat_open;
         bool can_move = keys && !spectating;
 
-        // F8 makes a new maze: in singleplayer straight away; in multiplayer only the host (or
-        // Player 1, on a dedicated server) can, and it starts a new round for everyone. One maze
-        // per press, not one per frame held.
+        // F8 makes a new maze: in singleplayer straight away; in multiplayer it starts a vote
+        // for one (as typing "votemap" does). F1 and F2 vote Yes and No. One press, one action.
         bool f8_down = keys && glfwGetKey(window, GLFW_KEY_F8) == GLFW_PRESS;
         if (f8_down && !f8_pressed) {
             if (mode == Mode::Single) regenerate_maze();
-            else if (mode == Mode::Host) host_start_round();
-            else if (server_dedicated && my_slot == 1) {
-                net::Writer w;
-                w.put<uint8_t>(MSG_REQUEST_START);
-                net.send_to_host(w.buf, true);
-            }
+            else request_vote();
         }
         f8_pressed = f8_down;
+        if (keys && mode != Mode::Single) {
+            if (f1_presses) cast_vote(true);
+            else if (f2_presses) cast_vote(false);
+        }
+
+        // Crouch while Ctrl is held: nobody crouches while typing, spectating (Ctrl flies down
+        // then), dead, or as the Beast. The change runs over CROUCH_SECONDS either way.
+        crouching = keys && !free_fly && !showing_die && !is_beast()
+                 && (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
+        double crouch_step = delta / CROUCH_SECONDS;
+        crouch = crouching ? std::min(1.0, crouch + crouch_step) : std::max(0.0, crouch - crouch_step);
 
         // Tab toggles the map view (press to switch, no longer hold-to-view).
         bool tab_down = keys && glfwGetKey(window, GLFW_KEY_TAB) == GLFW_PRESS;
@@ -4058,6 +4398,7 @@ public:
 
         double move_speed = 0.04182 * 60.0 * delta; // 15% slower again (was 0.0492)
         if (is_beast()) move_speed *= BEAST_SPEED;
+        move_speed *= 1.0 - (1.0 - CROUCH_SPEED) * eased(crouch);
 
         if (free_fly) {
             if (keys) fly(move_speed * 1.5);
@@ -4253,7 +4594,7 @@ public:
             if (!r.present || !r.has_state || !r.alive) continue;
             double feet = floor_height(r.rx, r.ry, r.level) + r.jump;
             glm::vec4 tint = glfwGetTime() < r.flash_until ? glm::vec4(1.8f, 0.4f, 0.4f, 1.0f) : glm::vec4(1.0f);
-            draw_player_model(r.rx, feet, r.ry, r.yaw, r.pitch, r.walk_phase, r.walk_amount, tint);
+            draw_player_model(r.rx, feet, r.ry, r.yaw, r.pitch, r.walk_phase, r.walk_amount, eased(r.crouch), tint);
         }
 
         std::vector<Sprite> sprites;

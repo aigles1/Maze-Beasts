@@ -39,7 +39,7 @@
 
 namespace {
 
-const char* const VERSION = "0.41";
+const char* const VERSION = "0.42";
 constexpr double TICK = 1.0 / 60.0;   // monster AI rate: what a hosting player's game runs at 60 fps
 constexpr int MAX_PLAYERS = 3;
 constexpr int SPARE_CONNECTIONS = 2;  // so a 4th player is told "full" rather than timing out
@@ -109,6 +109,7 @@ private:
     uint8_t round_id = 0;
     double round_over_until = 0.0, monster_timer = 0.0;
     int beast_boss_id = -1;      // boss Player 3 steers, or -1
+    MapVote vote;                // a vote for a new maze (the rules are in protocol.h)
     std::chrono::steady_clock::time_point t0;
 
     double now() const { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
@@ -139,6 +140,67 @@ private:
         net::Writer w;
         w.put<uint8_t>(MSG_LOBBY).put<uint8_t>(lobby_mask());
         broadcast(w);
+    }
+
+    uint8_t playing_mask() const {
+        uint8_t mask = 0;
+        for (int s = 1; s <= MAX_PLAYERS; s++)
+            if (slots[s].peer >= 0 && slots[s].playing) mask = static_cast<uint8_t>(mask | (1 << s));
+        return mask;
+    }
+
+    // A line from the game itself (shown as "Game: ..." in chat): to everyone, or to one player.
+    void announce(const std::string& text) {
+        net::Writer w;
+        w.put<uint8_t>(MSG_CHAT).put<uint8_t>(0).put_text(text);
+        broadcast(w);
+        log_line("[game] " + text);
+    }
+
+    void tell(int slot, const std::string& text) {
+        net::Writer w;
+        w.put<uint8_t>(MSG_CHAT).put<uint8_t>(0).put_text(text);
+        send(slots[slot].peer, w);
+    }
+
+    // ---- Voting for a new maze -------------------------------------------------------------
+
+    void broadcast_vote(VoteState state) {
+        net::Writer w;
+        w.put<uint8_t>(MSG_VOTE).put<uint8_t>(vote.id).put<uint8_t>(static_cast<uint8_t>(vote.starter))
+         .put<uint8_t>(vote.voters).put<uint8_t>(vote.yes).put<uint8_t>(vote.no).put<uint8_t>(state)
+         .put<uint16_t>(static_cast<uint16_t>(std::min(65000.0, vote.seconds_left(now()) * 1000.0)));
+        broadcast(w);
+    }
+
+    void start_vote(int s) {
+        if (!in_round || round_over || !slots[s].playing) {
+            tell(s, "Votes can only be started during a maze.");
+            return;
+        }
+        int r = vote.start(s, playing_mask(), now());
+        if (r == -1) { tell(s, "A vote is already running: F1 = Yes, F2 = No."); return; }
+        if (r > 0) {
+            tell(s, "Nobody answered your last " + std::to_string(VOTE_SOLO_LIMIT) + " votes. You can start another in "
+                    + minutes_seconds(r) + ".");
+            return;
+        }
+        announce(name(s) + " started a vote for a new maze: F1 = Yes, F2 = No");
+        broadcast_vote(VOTE_OPEN);
+        settle_vote();
+    }
+
+    // Once a tick, and after every change: pass, fail or expire it once that's decided.
+    void settle_vote() {
+        if (!vote.active) return;
+        VoteState state = vote.check(now());
+        if (state == VOTE_OPEN) return;
+        broadcast_vote(state);
+        if (state == VOTE_PASSED) {
+            announce("Vote passed: here's a new maze!");
+            start_round();
+        }
+        else announce(state == VOTE_FAILED ? "Vote failed: no new maze." : "Vote expired: not enough players voted.");
     }
 
     // Move players down to fill gaps, so slots run 1, 2, 3 with nobody missing - there is
@@ -198,12 +260,14 @@ private:
         log_line(name(s) + " left (" + slots[s].address + ")");
         bool was_playing = slots[s].playing;
         slots[s] = Slot{};
+        vote.remove_player(s); // a running vote is settled without them at the next tick
 
         if (player_count() == 0) {
             if (in_round) log_line("everyone has left - back to waiting for players");
             in_round = false;
             round_over = false;
             beast_boss_id = -1;
+            vote.cancel();
             return;
         }
         if (!in_round) {
@@ -231,6 +295,7 @@ private:
 
     void start_round() {
         compact(); // the lowest slots are the explorers
+        vote.cancel(); // a new maze makes any vote moot; the players clear theirs when it starts
         round_id++;
         uint32_t seed = next_seed;
         next_seed = World::random_seed();
@@ -272,6 +337,7 @@ private:
         in_round = false;
         round_over = false;
         beast_boss_id = -1;
+        vote.cancel();
         for (int s = 1; s <= MAX_PLAYERS; s++) slots[s].playing = false;
         net::Writer w;
         w.put<uint8_t>(MSG_TO_LOBBY);
@@ -325,6 +391,7 @@ private:
             monster_timer = MONSTER_INTERVAL;
             send_monsters();
         }
+        settle_vote();
         if (round_over && t >= round_over_until) start_round();
     }
 
@@ -365,12 +432,17 @@ private:
         }
 
         if (type == MSG_REQUEST_START) {
-            // Player 1's Start button in the lobby, or F8 for a fresh maze during a game.
-            if (s != 1) return;
-            if (!in_round && player_count() >= 2) start_round();
-            else if (in_round && slots[1].playing) {
-                log_line("Player 1 asked for a new maze");
-                start_round();
+            // Player 1's Start button in the lobby. (During a game, a new maze takes a vote.)
+            if (s == 1 && !in_round && player_count() >= 2) start_round();
+            return;
+        }
+        if (type == MSG_VOTE_START) { start_vote(s); return; }
+        if (type == MSG_VOTE_CAST) {
+            uint8_t choice = r.get<uint8_t>();
+            if (r.ok && in_round && vote.cast(s, choice != 0)) {
+                log_line(name(s) + " voted " + (choice ? "Yes" : "No"));
+                broadcast_vote(VOTE_OPEN);
+                settle_vote();
             }
             return;
         }

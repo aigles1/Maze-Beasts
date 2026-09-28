@@ -14,14 +14,19 @@ Defeat the bosses and find the exit of the maze.
 | **Mouse** | Look and aim |
 | **Left click** | Shoot |
 | **Spacebar** | Jump |
+| **Ctrl** (hold) | Crouch: lower and slower, and a smaller target |
 | **Tab** | Show the entire maze |
-| **F8** | Generate a new maze (in multiplayer, host only) |
+| **F8** | Generate a new maze (in multiplayer: start a vote for one) |
+| **F1 / F2** | Vote Yes / No on a new maze (multiplayer) |
+| **F5** | Developer mode (singleplayer only; then F6 and F7 teleport) |
 | **Enter** | Chat: type a message (up to 200 characters), then **Enter** again to send it |
 | **Y** | Open or close the chat log |
 | **Ctrl+C / Ctrl+V** | Copy and paste, in chat and in the Join screen's address box |
 | **Esc** | Close the chat line or chat log; otherwise open the menu (choose **Exit** there to close the game) |
 
 While spectating in multiplayer, **W A S D** and the mouse fly you around, **Spacebar** goes up and **Ctrl** (or **C**) goes down.
+
+**Esc → Controls** shows these in the game.
 
 ## Chat
 
@@ -50,6 +55,13 @@ Press **Esc** for the menu: **Singleplayer**, **Multiplayer - Join**, **Multipla
 - The explorers are soldiers in urban camouflage with blue helmets, and they can shoot each other. A killed player spectates for 5 seconds, flying freely around the maze, then respawns at their own starting point.
 - **Player 3** is optional, and controls one of the bosses, *the Beast*. If that boss dies, Player 3 takes over another surviving boss. With no boss left, Player 3 spectates until the next maze.
 
+**Voting for a new maze:** press **F8**, or type `votemap` in chat, to start a vote; starting it counts as your Yes. Everyone else votes with **F1** (Yes) or **F2** (No).
+
+- It passes with 2 Yes votes (or with your own, if you're the only player). A new maze then starts for everyone, like F8 in singleplayer.
+- It fails as soon as 2 Yes votes are out of reach, for example when 2 players vote No.
+- If it isn't decided within 17 seconds, it expires.
+- If you start 5 votes in a row that nobody else answers, you have to wait 4 minutes before starting another. Votes that others take part in, and any that pass, never count against you.
+
 **Playing across computers:**
 
 - The host may see a Windows Firewall prompt the first time they host. Allow it on private networks for LAN play.
@@ -61,7 +73,7 @@ Press **Esc** for the menu: **Singleplayer**, **Multiplayer - Join**, **Multipla
 
 Instead of one player hosting, everyone can join a **dedicated server**: a separate program with no window that runs the maze, its monsters and the rounds. It builds and runs on Linux, so it can live on a cloud machine such as an AWS EC2 instance, and nobody has to forward ports on their router.
 
-- Players join it with *Multiplayer - Join* and its IP address. The first to join is Player 1 and starts the game from the lobby. Player 1 can press **F8** for a new maze.
+- Players join it with *Multiplayer - Join* and its IP address. The first to join is Player 1 and starts the game from the lobby. After that, a new maze takes a vote (**F8** or `votemap`).
 - Someone who joins while a maze is under way plays from the next maze.
 - `Test with a dedicated server.bat` opens two game windows and connects both to a server you name. `Test dedicated server on this PC.bat` runs the Windows build of the server (`MazeBeastsServer.exe`) with two games joined to it.
 
