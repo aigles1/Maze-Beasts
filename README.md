@@ -78,7 +78,7 @@ Instead of one player hosting, everyone can join a **dedicated server**: a separ
 - The release includes `MazeBeastsServer.exe`, the server for Windows (for a LAN, or to try it on one PC), and `mazebeasts-server-<version>-src.tar.gz`, its source for building on Linux.
 - To try it on one PC, run `MazeBeastsServer.exe`, then start two games that join it: `MazeBeasts.exe --windowed=left --join=127.0.0.1` and `MazeBeasts.exe --windowed=right --join=127.0.0.1`. Games and server must be the same version.
 
-See [MazeBeastsServer/README.md](MazeBeastsServer/README.md) to build it on Linux and set it up on EC2.
+See [MazeBeastsServer/README.md](MazeBeastsServer/README.md) to build and run it on Linux.
 
 ## Why C++
 
@@ -111,7 +111,7 @@ powershell -ExecutionPolicy Bypass -File tools\make-server-bundle.ps1
 ## Future plans
 
 I might get rid of the projectiles in the future and just show damage on the walls and monsters.
-Update: 9/28 I have a working multiplayer version, will upload soon
+Eventually I will make a story about UN soldiers training in a facility.
 
 ## License
 
