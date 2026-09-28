@@ -15,6 +15,11 @@
 !MazeBeasts/MazeBeasts.vcxproj.user
 !MazeBeasts/mazebeasts.cpp
 !MazeBeasts/glad.c
+!MazeBeasts/net.h
+!MazeBeasts/net.cpp
+
+# ENet (reliable UDP for multiplayer), vendored source - see MazeBeasts/enet/VERSION.txt
+!MazeBeasts/enet/**
 
 # Third-party headers and the GLFW static libraries (Debug links glfw3.lib, Release glfw3_mt.lib)
 !MazeBeasts/include/**

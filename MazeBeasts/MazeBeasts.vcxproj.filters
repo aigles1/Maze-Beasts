@@ -13,6 +13,9 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="ENet">
+      <UniqueIdentifier>{9B7D4E2A-3C61-4F0E-8A55-2E6B1D7C4F90}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="glad.c">
@@ -21,6 +24,41 @@
     <ClCompile Include="mazebeasts.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="net.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="enet\callbacks.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="enet\compress.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="enet\host.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="enet\list.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="enet\packet.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="enet\peer.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="enet\protocol.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="enet\unix.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+    <ClCompile Include="enet\win32.c">
+      <Filter>ENet</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="net.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Font Include="LiberationSans-Regular.ttf" />

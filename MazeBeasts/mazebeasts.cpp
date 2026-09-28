@@ -17,6 +17,8 @@
 #include <cstring>
 #include <cstdint>
 
+#include "net.h" // multiplayer; kept free of winsock so it can't clash with miniaudio's <windows.h>
+
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
@@ -195,11 +197,14 @@ struct Monster {
     double target_x, target_y;
     int cooldown;
     int hit_flash = 0; // frames remaining to render this monster tinted red after being hit
+    int id = 0;        // stable across the network: assigned in spawn order, identical everywhere
+    double net_x = 0.0, net_y = 0.0; // latest networked position, which x/y glide toward
 };
 
 struct HealthPack {
     double x, y;
     int level = 0; // 0 = maze, 1 = lower level; both share the same x/y footprint
+    int id = 0;    // stable across the network, so a pickup names the right pack
 };
 
 // Medpacks sit on the floor and are small enough to step around. The pickup radius is what
@@ -229,6 +234,23 @@ struct Projectile {
     double dir_z = 0.0;  // vertical component of travel direction
     bool from_boss = false; // boss shots hit harder and render smaller
     int level = 0;       // which level's walls this shot collides with (0 = maze, 1 = lower)
+    int owner = 0;       // who fired it: 0 = a monster, 1-3 = that player's slot
+};
+
+// Command-line switches. The multiplayer ones exist mainly so two or three copies can be
+// launched side by side and wired together without clicking through the menus.
+struct LaunchOptions {
+    bool windowed = false;   // --windowed[=left|right]: a normal window instead of fullscreen
+    int window_side = 0;     // 0 = let Windows place it, 1 = left half, 2 = right half
+    bool host = false;       // --host: start hosting as soon as the game opens
+    std::string join;        // --join=ADDRESS: connect to a host as soon as the game opens
+    int autostart = 0;       // --autostart=N: the host starts the round once N players are in
+    double quit_after = 0.0; // --quit-after=SECONDS: close by itself (automated tests)
+    bool test = false;       // --test: small unfocused window, mouse left free, sound off
+    bool test_fire = false;  // --test-fire: shoot every 2 s without input (tests the shot relay)
+    bool test_spawn_near = false; // --test-spawn-near: Player 2 starts face to face with Player 1
+    bool open_menu = false;  // --open-menu: start with the Esc menu showing
+    std::string screenshot;  // --screenshot=FILE: save the last frame as a .bmp before quitting
 };
 
 struct Sprite {
@@ -367,8 +389,109 @@ private:
     ma_sound boss_sound;         // looping cue kept as a handle so we can stop it
     bool boss_sound_active = false;
 
+    // --- Multiplayer -----------------------------------------------------------------------
+    // One machine hosts; the others connect to it directly by IP. The host is the authority on
+    // monsters, bosses, medpacks and when a round ends, and relays every player's messages to
+    // the rest. Each player is the authority on their own movement and health: the shooter's
+    // machine decides damage to monsters, and a victim's machine decides damage to itself.
+    //
+    // Slots: 1 = the host, who starts where singleplayer does; 2 = starts at the exit and must
+    // escape through Player 1's start; 3 = optional, controls one of the bosses ("the Beast").
+    //
+    // Every message starts with its type byte. Gameplay messages then carry the round number,
+    // so anything still in flight from a previous maze is recognised and ignored.
+    enum Msg : uint8_t {
+        MSG_HELLO = 1,    // C->H  u8 protocol version
+        MSG_WELCOME,      // H->C  u8 slot, u32 seed
+        MSG_REJECT,       // H->C  u8 reason
+        MSG_LOBBY,        // H->C  u8 bit mask of occupied slots
+        MSG_ASSIGN,       // H->C  u8 new slot (the Beast moves up if Player 2 leaves the lobby)
+        MSG_START,        // H->C  u8 round, u32 seed, i32 Beast's boss id, u8 slot mask
+        MSG_STATE,        // any   u8 round, u8 slot, u8 level, u8 flags, f32 x y jump yaw pitch, i16 hp
+        MSG_SHOT,         // any   u8 round, u8 owner, u8 level, u8 boss shot, f32 x y z dx dy dz speed
+        MSG_MONSTERS,     // H->C  u8 round, u16 count, count x {i32 id, f32 x y, i32 hp, u8 type, u8 flash}
+        MSG_MONSTER_HIT,  // C->H  u8 round, i32 monster id, i32 damage
+        MSG_DEATH,        // any   u8 round, u8 victim, u8 killer (0 = a monster)
+        MSG_PICKUP,       // C->H  u8 round, i32 medpack id
+        MSG_PACK_GONE,    // H->C  u8 round, i32 medpack id
+        MSG_REACHED_EXIT, // C->H  u8 round, u8 slot
+        MSG_ROUND_OVER,   // H->C  u8 round, u8 winner
+        MSG_BEAST_BOSS,   // H->C  u8 round, i32 boss id the Beast now controls (-1 = none left)
+    };
+    static constexpr uint8_t PROTOCOL_VERSION = 1;
+    enum RejectReason : uint8_t { REJECT_IN_PROGRESS = 1, REJECT_VERSION = 2, REJECT_FULL = 3 };
+
+    static constexpr double STATE_INTERVAL      = 1.0 / 30.0; // own position, 30 times a second
+    static constexpr double MONSTER_INTERVAL    = 1.0 / 20.0; // host's monster snapshot
+    static constexpr int    PVP_DAMAGE          = 5;          // 4 hits down a full-health player
+    static constexpr double BEAST_SPEED         = 0.85;       // times a player's speed
+    static constexpr double BEAST_FIRE_INTERVAL = 0.6;        // seconds between the Beast's shots
+    static constexpr int    BEAST_MAX_HP        = 440;        // top of the boss health range
+    static constexpr double ROUND_OVER_SECONDS  = 5.0;        // winner banner before the next maze
+    // Other players are drawn as a small figure: about 0.6 tall, head roughly at eye height.
+    static constexpr float  PLAYER_SPRITE_HALF  = 0.36f;
+    static constexpr float  PLAYER_SPRITE_SINK  = 0.72f * 6.0f / 128.0f; // empty rows under the feet
+    static constexpr double PLAYER_HIT_RADIUS   = 0.22;
+    static constexpr double PLAYER_HIT_HEIGHT   = 0.6;
+
+    enum class Mode { Single, Host, Client };
+    enum class Screen { None, Main, Host, Join };
+    enum class MenuAction { None, Single, Join, Host, Exit, StartGame, CancelHost, Connect, BackFromJoin };
+
+    struct RemotePlayer {
+        bool present = false;    // in this game (lobby or round)
+        bool has_state = false;  // at least one position received this round
+        double x = 0, y = 0;     // latest reported position
+        double rx = 0, ry = 0;   // smoothed position, used for drawing and hit tests
+        double jump = 0, yaw = 0, pitch = 0;
+        int level = 0, hp = 20;
+        bool alive = true;
+        double flash_until = 0;  // brief red tint after being hurt
+        bool logged = false;     // first-position log line already written this round
+    };
+
+    LaunchOptions opts;
+    net::Session net;
+    Mode mode = Mode::Single;
+    Screen screen = Screen::None;
+    int my_slot = 1;             // singleplayer is always slot 1
+    uint32_t round_seed = 0;
+    uint8_t round_id = 0;
+    bool in_round = false;       // a multiplayer round is running (false in singleplayer and lobby)
+    bool round_over = false;
+    int round_winner = 0;
+    double round_over_until = 0.0;
+    uint8_t lobby_mask = 1;      // bit per occupied slot
+    RemotePlayer remote[4];      // indexed by slot; the entry for my own slot is unused
+    int slot_peer[4] = { -1, -1, -1, -1 }; // host: which network peer holds each slot
+    int beast_boss_id = -1;      // boss Player 3 controls, or -1
+    bool spectating = false;     // the Beast with no boss left to control
+    int last_damage_by = 0;      // who hurt us last, so a death names the killer
+    int killed_by = 0;
+    bool exit_reported = false;
+    bool logged_snapshot = false;
+    bool logged_shot[4] = { false, false, false, false };
+    double state_timer = 0.0, monster_timer = 0.0, test_fire_timer = 0.0;
+    double last_beast_shot = -10.0;
+    std::vector<std::pair<std::string, double>> feed; // kill feed: text, time it disappears
+    std::vector<std::string> host_ips;
+    GLuint player_tex = 0;
+    glm::mat4 last_proj = glm::mat4(1.0f), last_view = glm::mat4(1.0f); // for name labels
+
+    // Menu UI state
+    std::string menu_status;
+    bool menu_status_error = false;
+    std::string join_address = "127.0.0.1";
+    bool join_connecting = false, join_connected = false;
+    int menu_focus = 0;
+    double menu_last_mx = -1.0, menu_last_my = -1.0;
+    bool esc_pressed = false, f8_pressed = false, click_prev = false;
+    bool up_prev = false, down_prev = false, enter_prev = false;
+    std::string typed;           // characters typed this frame (from the char callback)
+    int backspaces = 0;          // backspace presses this frame, including key repeat
+
 public:
-    MazeGame() : rng(static_cast<std::mt19937::result_type>(
+    MazeGame(const LaunchOptions& options) : opts(options), rng(static_cast<std::mt19937::result_type>(
         std::chrono::steady_clock::now().time_since_epoch().count())) {
         // Load the bundle first: textures, the font and audio all read through it.
         // Without it every lookup falls back to loose files, so a dev checkout still runs.
@@ -380,55 +503,28 @@ public:
         init_glfw();
         init_glad();
         init_opengl();
-        init_audio();
+        if (!opts.test) init_audio(); // --test copies run muted, so several can run at once quietly
         init_font();
         init_draw_buffers();
         build_gun_mesh();
         load_textures();
-        generate_maze();
-        generate_lower_level();
-        carve_staircase();
-        player_pos_x = start.first + 0.5;
-        player_pos_y = start.second + 0.5;
-        dir_x = 1.0;
-        dir_y = 0.0;
-        yaw = 0.0;
-        pitch = 0.0;
-        spawn_monsters();
-        spawn_health_packs();
-        build_meshes();
+        player_tex = create_player_texture();
+        new_maze(random_seed(), true);
+
+        if (opts.host) begin_hosting();
+        else if (!opts.join.empty()) {
+            join_address = opts.join;
+            open_menu(Screen::Join);
+            begin_join();
+        }
+        else if (opts.open_menu) open_menu(Screen::Main);
         run();
     }
 
     ~MazeGame() {
-        glDeleteVertexArrays(1, &wall_vao);
-        glDeleteBuffers(1, &wall_vbo);
-        glDeleteBuffers(1, &wall_ebo);
-        glDeleteVertexArrays(1, &boundary_vao);
-        glDeleteBuffers(1, &boundary_vbo);
-        glDeleteBuffers(1, &boundary_ebo);
-        glDeleteVertexArrays(1, &floor_vao);
-        glDeleteBuffers(1, &floor_vbo);
-        glDeleteBuffers(1, &floor_ebo);
-        glDeleteVertexArrays(1, &ceiling_vao);
-        glDeleteBuffers(1, &ceiling_vbo);
-        glDeleteBuffers(1, &ceiling_ebo);
-        glDeleteVertexArrays(1, &lower_wall_vao);
-        glDeleteBuffers(1, &lower_wall_vbo);
-        glDeleteBuffers(1, &lower_wall_ebo);
-        glDeleteVertexArrays(1, &lower_boundary_vao);
-        glDeleteBuffers(1, &lower_boundary_vbo);
-        glDeleteBuffers(1, &lower_boundary_ebo);
-        glDeleteVertexArrays(1, &lower_floor_vao);
-        glDeleteBuffers(1, &lower_floor_vbo);
-        glDeleteBuffers(1, &lower_floor_ebo);
-        glDeleteVertexArrays(1, &stair_vao);
-        glDeleteBuffers(1, &stair_vbo);
-        glDeleteBuffers(1, &stair_ebo);
-        glDeleteVertexArrays(1, &mini_wall_vao);
-        glDeleteBuffers(1, &mini_wall_vbo);
-        glDeleteVertexArrays(1, &mini_lower_vao);
-        glDeleteBuffers(1, &mini_lower_vbo);
+        net.stop(); // tell the other players we've gone, rather than leaving them to time out
+        release_level_meshes();
+        glDeleteTextures(1, &player_tex);
         glDeleteVertexArrays(1, &gun_vao);
         glDeleteBuffers(1, &gun_vbo);
         glDeleteBuffers(1, &gun_ebo);
@@ -553,10 +649,13 @@ public:
 
     // World height of the surface under a position. On the staircase this ramps smoothly
     // between the two floors; everywhere else it is whichever floor the player is on.
-    double floor_y_at(double x, double y) const {
+    double floor_y_at(double x, double y) const { return floor_height(x, y, player_level); }
+
+    // Same, for anyone on a given level (other players carry their own level).
+    double floor_height(double x, double y, int level) const {
         if (is_stair_cell(static_cast<int>(x), static_cast<int>(y)))
             return stair_progress(x) * lower_floor_y;
-        return player_level == 0 ? 0.0 : lower_floor_y;
+        return level == 0 ? 0.0 : lower_floor_y;
     }
 
     double player_eye_y() const { return floor_y_at(player_pos_x, player_pos_y) + 0.5 + jump_height; }
@@ -571,6 +670,13 @@ public:
 
     // True if nothing blocks a straight line between two points in the maze (grid + connections).
     bool has_line_of_sight(double x0, double y0, double x1, double y1) {
+        return line_of_sight(0, x0, y0, x1, y1);
+    }
+
+    // The same test on either level's walls.
+    bool line_of_sight(int level, double x0, double y0, double x1, double y1) {
+        const auto& g = grid_for(level);
+        auto& conn = conn_for(level);
         double dx = x1 - x0, dy = y1 - y0;
         double dist = std::hypot(dx, dy);
         int steps = std::max(1, static_cast<int>(std::ceil(dist / 0.05)));
@@ -581,10 +687,10 @@ public:
             int ocx = static_cast<int>(cx), ocy = static_cast<int>(cy);
             int ncx = static_cast<int>(nx), ncy = static_cast<int>(ny);
             if (ncx < 0 || ncx >= grid_size || ncy < 0 || ncy >= grid_size) return false;
-            if (grid[ncy][ncx] != 0) return false;
+            if (g[ncy][ncx] != 0) return false;
             if (ncx != ocx || ncy != ocy) {
                 if (std::abs(ncx - ocx) + std::abs(ncy - ocy) > 1) return false; // cut a corner
-                if (connections[{ocx, ocy}].find({ncx, ncy}) == connections[{ocx, ocy}].end()) return false;
+                if (conn[{ocx, ocy}].find({ncx, ncy}) == conn[{ocx, ocy}].end()) return false;
             }
             cx = nx; cy = ny;
         }
@@ -641,8 +747,11 @@ public:
         inside_boss_room = cur;
 
         double nearest_boss = 1e9;
-        for (const auto& m : monsters)
-            if (m.type == 2) nearest_boss = std::min(nearest_boss, std::hypot(m.x - player_pos_x, m.y - player_pos_y));
+        for (const auto& m : monsters) {
+            if (m.type != 2) continue;
+            if (is_beast() && m.id == beast_boss_id) continue; // the Beast doesn't hear its own music
+            nearest_boss = std::min(nearest_boss, std::hypot(m.x - player_pos_x, m.y - player_pos_y));
+        }
         bool want_boss_sound = nearest_boss < (boss_sound_active ? boss_cue_stop : boss_cue_start);
         if (want_boss_sound) start_boss_sound();
         else stop_boss_sound();
@@ -656,24 +765,62 @@ public:
 #ifdef __APPLE__
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
-        // Fullscreen windowed (borderless)
         GLFWmonitor* monitor = glfwGetPrimaryMonitor();
-        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
-        screen_width = mode->width;
-        screen_height = mode->height;
-        glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-        window = glfwCreateWindow(screen_width, screen_height, "MazeBeasts - 3D", nullptr, nullptr);
+        const GLFWvidmode* vid = glfwGetVideoMode(monitor);
+        if (opts.windowed || opts.test) {
+            // A normal window, so several copies can sit side by side for multiplayer testing.
+            int w = opts.test ? 640 : vid->width / 2 - 24;
+            int h = opts.test ? 360 : w * 9 / 16;
+            glfwWindowHint(GLFW_DECORATED, GLFW_TRUE);
+            glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+            if (opts.test) {
+                glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);      // don't steal focus from whatever
+                glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE); // you're doing while tests run
+            }
+            window = glfwCreateWindow(w, h, "MazeBeasts - 3D", nullptr, nullptr);
+            if (window && opts.window_side == 1) glfwSetWindowPos(window, 12, 60);
+            else if (window && opts.window_side == 2) glfwSetWindowPos(window, vid->width / 2 + 12, 60);
+        }
+        else {
+            // Fullscreen windowed (borderless)
+            screen_width = vid->width;
+            screen_height = vid->height;
+            glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+            glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+            window = glfwCreateWindow(screen_width, screen_height, "MazeBeasts - 3D", nullptr, nullptr);
+            if (window) glfwSetWindowPos(window, 0, 0);
+        }
         if (!window) {
             std::cerr << "Failed to create GLFW window" << std::endl;
             glfwTerminate();
             exit(-1);
         }
-        glfwSetWindowPos(window, 0, 0);
+        glfwGetFramebufferSize(window, &screen_width, &screen_height);
         glfwMakeContextCurrent(window);
-        glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
         glfwSetWindowUserPointer(window, this);
+        glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+        glfwSetCharCallback(window, char_callback);
+        glfwSetKeyCallback(window, key_callback);
+        glfwSetWindowFocusCallback(window, focus_callback);
+        glfwSetInputMode(window, GLFW_CURSOR, opts.test ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED);
+    }
+
+    // Typing into the menu's address box.
+    static void char_callback(GLFWwindow* w, unsigned int codepoint) {
+        MazeGame* game = static_cast<MazeGame*>(glfwGetWindowUserPointer(w));
+        if (codepoint >= 32 && codepoint < 127) game->typed.push_back(static_cast<char>(codepoint));
+    }
+
+    // Backspace comes through here rather than polling so that holding it repeats.
+    static void key_callback(GLFWwindow* w, int key, int, int action, int) {
+        MazeGame* game = static_cast<MazeGame*>(glfwGetWindowUserPointer(w));
+        if (key == GLFW_KEY_BACKSPACE && (action == GLFW_PRESS || action == GLFW_REPEAT)) game->backspaces++;
+    }
+
+    // Coming back to the window (alt-tab, or clicking between copies) mustn't jerk the view.
+    static void focus_callback(GLFWwindow* w, int focused) {
+        MazeGame* game = static_cast<MazeGame*>(glfwGetWindowUserPointer(w));
+        if (focused) game->first_mouse = true;
     }
 
     static void framebuffer_size_callback(GLFWwindow* w, int width, int height) {
@@ -799,6 +946,11 @@ public:
         glGenTextures(1, &font_tex);
         glBindTexture(GL_TEXTURE_2D, font_tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, font_bitmap_w, font_bitmap_h, 0, GL_RED, GL_UNSIGNED_BYTE, font_bitmap);
+        // The atlas is one channel of glyph coverage. Read as-is it samples as (coverage, 0, 0, 1),
+        // so all text came out red inside opaque black boxes. Present it as white with the
+        // coverage as alpha instead: text then takes whatever colour it's drawn with.
+        const GLint swizzle[] = { GL_ONE, GL_ONE, GL_ONE, GL_RED };
+        glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzle);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1198,27 +1350,73 @@ public:
         link(connections, { bypass_end, bypass }, { bypass_end, sy });
     }
 
-    void regenerate_maze() {
+    static uint32_t random_seed() {
+        std::random_device rd;
+        return rd() ^ static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+
+    // Build a maze, its lower level, monsters and medpacks from one seed. In multiplayer every
+    // machine calls this with the host's seed and gets an identical world: the generator draws
+    // from the random stream in exactly the same order everywhere, and everyone runs the same
+    // build of the game, so even the standard library's distributions agree.
+    void new_maze(uint32_t seed, bool reset_facing) {
+        rng.seed(seed);
         generate_maze();
         generate_lower_level();
         carve_staircase();
-        player_level = 0;
-        jump_height = 0.0;
-        jump_velocity = 0.0;
-        player_pos_x = start.first + 0.5;
-        player_pos_y = start.second + 0.5;
         spawn_monsters();
         spawn_health_packs();
+        build_meshes();
         projectiles.clear();
         monster_projectiles.clear();
-        player_hp = max_hp;
-        damage_cooldown = 0;
-        build_meshes();
         showing_win = false;
         showing_die = false;
         monster_in_view = false;
         inside_boss_room = -1;
         stop_boss_sound();
+        place_player_at_spawn(reset_facing);
+    }
+
+    void regenerate_maze() { new_maze(random_seed(), false); }
+
+    // Player 2 starts at the exit and escapes through Player 1's start, so the two swap ends.
+    std::pair<int, int> spawn_cell(int slot) const { return slot == 2 ? end : start; }
+    std::pair<int, int> exit_cell(int slot) const { return slot == 2 ? start : end; }
+
+    // A heading, in degrees, that looks down an open passage from a cell instead of at a wall.
+    double open_facing_yaw(std::pair<int, int> c) {
+        const int dxs[4] = { 1, 0, -1, 0 };
+        const int dys[4] = { 0, 1, 0, -1 };
+        for (int i = 0; i < 4; i++)
+            if (connections[c].count({ c.first + dxs[i], c.second + dys[i] }))
+                return glm::degrees(std::atan2(static_cast<double>(dys[i]), static_cast<double>(dxs[i])));
+        return 0.0;
+    }
+
+    void face(double yaw_degrees) {
+        yaw = yaw_degrees;
+        pitch = 0.0;
+        dir_x = std::cos(glm::radians(yaw));
+        dir_y = std::sin(glm::radians(yaw));
+    }
+
+    void place_player_at_spawn(bool reset_facing) {
+        auto c = spawn_cell(my_slot);
+        player_pos_x = c.first + 0.5;
+        player_pos_y = c.second + 0.5;
+        player_level = 0;
+        jump_height = 0.0;
+        jump_velocity = 0.0;
+        player_hp = max_hp;
+        damage_cooldown = 0;
+        last_damage_by = 0;
+        if (reset_facing) face(open_facing_yaw(c));
+        if (opts.test_spawn_near && my_slot == 2 && mode != Mode::Single) {
+            // Test only: one tile in front of Player 1, looking back at them.
+            player_pos_x = start.first + 1.5;
+            player_pos_y = start.second + 0.5;
+            face(180.0);
+        }
     }
 
     // Reset the player to the maze start without regenerating the maze layout.
@@ -1320,6 +1518,12 @@ public:
             int boss_hp = std::uniform_int_distribution<int>(310, 440)(rng); // 7-9 body shots (50 each) or 3 headshots (150) to kill
             monsters.push_back({ mx + 0.5, my + 0.5, boss_hp, 2, mx + 0.5, my + 0.5, std::uniform_int_distribution<int>(0, 60)(rng) });
         }
+        // Ids follow spawn order, so every machine that built this maze agrees on them.
+        for (size_t i = 0; i < monsters.size(); i++) {
+            monsters[i].id = static_cast<int>(i);
+            monsters[i].net_x = monsters[i].x;
+            monsters[i].net_y = monsters[i].y;
+        }
     }
 
     void spawn_health_packs() {
@@ -1347,6 +1551,7 @@ public:
             int hx = lower_cells[i].first, hy = lower_cells[i].second;
             health_packs.push_back({ hx + std::uniform_real_distribution<double>(0.2, 0.8)(rng), hy + std::uniform_real_distribution<double>(0.2, 0.8)(rng), 1 });
         }
+        for (size_t i = 0; i < health_packs.size(); i++) health_packs[i].id = static_cast<int>(i);
     }
 
     bool try_move(double new_x, double new_y) {
@@ -1354,6 +1559,8 @@ public:
         int new_cell_y = static_cast<int>(new_y);
         if (new_cell_x < 0 || new_cell_x >= grid_size || new_cell_y < 0 || new_cell_y >= grid_size) return false;
         if (grid_for(player_level)[new_cell_y][new_cell_x] != 0) return false;
+        // Bosses only exist on the maze level, so the Beast can't take the stairs down.
+        if (is_beast() && is_stair_cell(new_cell_x, new_cell_y)) return false;
         int old_cell_x = static_cast<int>(player_pos_x);
         int old_cell_y = static_cast<int>(player_pos_y);
         if (new_cell_x == old_cell_x && new_cell_y == old_cell_y) return true;
@@ -1412,7 +1619,100 @@ public:
         p.dir_x = aim_x; p.dir_y = aim_y; p.dir_z = aim_z;
         p.speed = speed;
         p.level = player_level;
+        p.owner = my_slot;
         projectiles.push_back(p);
+        if (mode != Mode::Single && in_round) send_shot(p);
+    }
+
+    // The Beast fires boss shots from the boss's body: slow, heavy, and horizontal like the
+    // bosses' own, with a cooldown so a human-driven boss can't outgun the AI ones by clicking.
+    void beast_shoot() {
+        double now = glfwGetTime();
+        if (now - last_beast_shot < BEAST_FIRE_INTERVAL) return;
+        last_beast_shot = now;
+        Projectile p;
+        p.x = player_pos_x; p.y = player_pos_y; p.z = 0.5;
+        p.dir_x = dir_x; p.dir_y = dir_y; p.dir_z = 0.0;
+        p.speed = 0.0714;
+        p.from_boss = true;
+        p.level = 0;
+        p.owner = 3;
+        monster_projectiles.push_back(p);
+        send_shot(p);
+    }
+
+    // Player 1 or 2 struck by a player's shot at this point, or 0. Nobody is hit by their own
+    // shots. Remote players are tested at their smoothed position, where they're drawn.
+    int explorer_hit(int owner, int level, double x, double y, double z) {
+        for (int s = 1; s <= 2; s++) {
+            if (s == owner) continue;
+            double px, py, jump;
+            int lvl;
+            if (s == my_slot) {
+                if (showing_die) continue;
+                px = player_pos_x; py = player_pos_y; lvl = player_level; jump = jump_height;
+            }
+            else {
+                const RemotePlayer& r = remote[s];
+                if (!r.present || !r.has_state || !r.alive) continue;
+                px = r.rx; py = r.ry; lvl = r.level; jump = r.jump;
+            }
+            if (lvl != level || std::hypot(px - x, py - y) > PLAYER_HIT_RADIUS) continue;
+            double feet = floor_height(px, py, lvl) + jump;
+            if (z < feet - 0.05 || z > feet + PLAYER_HIT_HEIGHT) continue;
+            return s;
+        }
+        return 0;
+    }
+
+    // Player 1 or 2 struck by a monster or Beast shot, or 0. Those shots stay on the maze
+    // level and have no height, exactly as monster shots always behaved against the player.
+    int explorer_hit_flat(double x, double y) {
+        for (int s = 1; s <= 2; s++) {
+            if (s == my_slot) {
+                if (!is_beast() && !showing_die && player_level == 0 && std::hypot(x - player_pos_x, y - player_pos_y) < 0.4)
+                    return s;
+            }
+            else {
+                const RemotePlayer& r = remote[s];
+                if (r.present && r.has_state && r.alive && r.level == 0 && std::hypot(x - r.rx, y - r.ry) < 0.4)
+                    return s;
+            }
+        }
+        return 0;
+    }
+
+    void take_damage(int amount, int by) {
+        if (showing_die || is_beast()) return;
+        player_hp -= amount;
+        last_damage_by = by;
+    }
+
+    Monster* find_monster(int id) {
+        for (auto& m : monsters) if (m.id == id) return &m;
+        return nullptr;
+    }
+
+    int boss_count() const {
+        int n = 0;
+        for (const auto& m : monsters) if (m.type == 2) n++;
+        return n;
+    }
+
+    // Authoritative damage to a monster: singleplayer and the host only. Clients report hits
+    // with MSG_MONSTER_HIT and see the result in the next monster snapshot.
+    void apply_monster_damage(int id, int dmg) {
+        for (auto it = monsters.begin(); it != monsters.end(); ++it) {
+            if (it->id != id) continue;
+            it->hp -= dmg;
+            it->hit_flash = 8; // briefly highlight red on a successful hit
+            if (it->hp <= 0) {
+                bool was_beast = (id == beast_boss_id);
+                monsters.erase(it);
+                if (was_beast && mode == Mode::Host) reassign_beast();
+            }
+            return;
+        }
     }
 
     void update_projectiles(double delta) {
@@ -1426,6 +1726,7 @@ public:
             bool hit = false;
             bool headshot = false;
             Monster* hit_monster = nullptr;
+            int hit_player = 0;
             // Each level has its own walls and its own floor/ceiling heights.
             const auto& lvl_grid = grid_for(it->level);
             auto& lvl_conn = conn_for(it->level);
@@ -1467,22 +1768,31 @@ public:
                         }
                     }
                 }
-                if (hit_wall || hit_monster) { hit = true; break; }
+                // In multiplayer a shot can also strike the other explorer.
+                if (!hit_monster && mode != Mode::Single)
+                    hit_player = explorer_hit(it->owner, it->level, new_x, new_y, new_z);
+                if (hit_wall || hit_monster || hit_player) { hit = true; break; }
                 it->x = new_x; it->y = new_y; it->z = new_z;
             }
             if (hit) {
+                int owner = it->owner;
                 it = projectiles.erase(it);
                 if (hit_monster) {
+                    int id = hit_monster->id;
                     int dmg;
                     if (hit_monster->type == 1)
                         dmg = headshot ? 300 : 100; // 1 headshot or 3 body shots
                     else
                         dmg = headshot ? 150 : 50;  // 3 headshots or 7-9 body shots
-                    hit_monster->hp -= dmg;
-                    hit_monster->hit_flash = 8; // briefly highlight red on a successful hit
-                    if (hit_monster->hp <= 0)
-                        monsters.erase(std::remove_if(monsters.begin(), monsters.end(), [hit_monster](const Monster& m){return &m==hit_monster;}), monsters.end());
+                    hit_monster->hit_flash = 8; // everyone sees the flash straight away
+                    // Only the shooter's machine turns the hit into damage, so it counts once.
+                    if (owner == my_slot) {
+                        if (mode == Mode::Client) send_monster_hit(id, dmg);
+                        else apply_monster_damage(id, dmg);
+                    }
                 }
+                // Likewise only the victim's machine applies damage to a player.
+                if (hit_player && hit_player == my_slot) take_damage(PVP_DAMAGE, owner);
             } else ++it;
         }
     }
@@ -1494,7 +1804,8 @@ public:
             int steps = std::max(1, static_cast<int>(std::ceil(move_dist / step_len)));
             double sx = (it->dir_x * move_dist) / steps;
             double sy = (it->dir_y * move_dist) / steps;
-            bool hit = false, hit_player = false;
+            bool hit = false;
+            int hit_player = 0;
             for (int s = 0; s < steps; ++s) {
                 double new_x = it->x + sx;
                 double new_y = it->y + sy;
@@ -1509,15 +1820,18 @@ public:
                     if (std::abs(new_cell_x - old_cell_x) + std::abs(new_cell_y - old_cell_y) > 1) hit_wall = true;
                     else if (connections[{old_cell_x, old_cell_y}].find({new_cell_x, new_cell_y}) == connections[{old_cell_x, old_cell_y}].end()) hit_wall = true;
                 }
-                // Monster shots travel the maze level only; the player is out of reach downstairs.
-                if (player_level == 0 && std::hypot(new_x - player_pos_x, new_y - player_pos_y) < 0.4) hit_player = true;
+                // Monster shots travel the maze level only; players downstairs are out of reach.
+                hit_player = explorer_hit_flat(new_x, new_y);
                 if (hit_wall || hit_player) { hit = true; break; }
                 it->x = new_x; it->y = new_y;
             }
             if (hit) {
                 bool was_boss = it->from_boss;
+                int owner = it->owner;
                 it = monster_projectiles.erase(it);
-                if (hit_player) player_hp -= (was_boss ? std::uniform_int_distribution<int>(4, 5)(rng) : 1); // 4-5 boss shots kill
+                // The victim's own machine applies the damage; others just see the shot vanish.
+                if (hit_player && hit_player == my_slot)
+                    take_damage(was_boss ? std::uniform_int_distribution<int>(4, 5)(rng) : 1, owner); // 4-5 boss shots kill
             } else ++it;
         }
     }
@@ -1526,6 +1840,16 @@ public:
         std::vector<std::pair<int, int>> directions = { {-1, 0}, {1, 0}, {0, -1}, {0, 1} };
         for (auto it = monsters.begin(); it != monsters.end(); ) {
             if (it->hit_flash > 0) it->hit_flash--; // fade out the red hit highlight
+            // The boss Player 3 controls: no AI, it just glides to wherever they last reported.
+            if (beast_active() && it->id == beast_boss_id) {
+                double k = std::min(1.0, delta * 15.0);
+                it->x += (it->net_x - it->x) * k;
+                it->y += (it->net_y - it->y) * k;
+                it->target_x = it->x;
+                it->target_y = it->y;
+                ++it;
+                continue;
+            }
             double dx = it->target_x - it->x;
             double dy = it->target_y - it->y;
             double dist = std::sqrt(dx * dx + dy * dy);
@@ -1556,21 +1880,22 @@ public:
 
             it->cooldown -= 1;
             if (it->cooldown <= 0) {
-                double dx_p = player_pos_x - it->x;
-                double dy_p = player_pos_y - it->y;
-                double p_dist = std::hypot(dx_p, dy_p);
-                // Hold fire while the player is on the lower level - the shot could not reach.
+                double tx = 0.0, ty = 0.0;
+                // Hold fire while nobody is on the maze level - the shot could not reach.
                 // The cooldown still resets below so they don't all volley the moment you return.
-                if (p_dist > 0 && player_level == 0) {
-                    double dir_x_p = dx_p / p_dist;
-                    double dir_y_p = dy_p / p_dist;
+                if (nearest_target(it->x, it->y, tx, ty)) {
+                    double dx_p = tx - it->x;
+                    double dy_p = ty - it->y;
+                    double p_dist = std::hypot(dx_p, dy_p);
                     bool is_boss = (it->type == 2);
                     Projectile mp;
                     mp.x = it->x; mp.y = it->y;
-                    mp.dir_x = dir_x_p; mp.dir_y = dir_y_p;
+                    mp.dir_x = dx_p / p_dist; mp.dir_y = dy_p / p_dist;
                     mp.speed = is_boss ? 0.0714 : 0.075; // boss projectiles slower than regular ones
                     mp.from_boss = is_boss;
+                    mp.owner = 0;
                     monster_projectiles.push_back(mp);
+                    if (mode == Mode::Host) send_shot(mp);
                 }
                 it->cooldown = (it->type == 2 ? 86 : 300); // boss fires 30% less often, monsters 40% less
             }
@@ -1848,7 +2173,26 @@ public:
         glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(id));
     }
 
+    // GPU buffers for the current maze. Rebuilding a maze used to allocate a fresh set without
+    // freeing the old one; with a new maze every multiplayer round that leak adds up.
+    bool meshes_built = false;
+
+    void release_level_meshes() {
+        if (!meshes_built) return;
+        GLuint vaos[] = { wall_vao, boundary_vao, floor_vao, ceiling_vao, lower_wall_vao,
+                          lower_boundary_vao, lower_floor_vao, stair_vao, mini_wall_vao, mini_lower_vao };
+        GLuint bufs[] = { wall_vbo, wall_ebo, boundary_vbo, boundary_ebo, floor_vbo, floor_ebo,
+                          ceiling_vbo, ceiling_ebo, lower_wall_vbo, lower_wall_ebo, lower_boundary_vbo,
+                          lower_boundary_ebo, lower_floor_vbo, lower_floor_ebo, stair_vbo, stair_ebo,
+                          mini_wall_vbo, mini_lower_vbo };
+        glDeleteVertexArrays(static_cast<GLsizei>(std::size(vaos)), vaos);
+        glDeleteBuffers(static_cast<GLsizei>(std::size(bufs)), bufs);
+        meshes_built = false;
+    }
+
     void build_meshes() {
+        release_level_meshes();
+        meshes_built = true;
         wall_vertices.clear();
         boundary_vertices.clear();
         mini_wall_verts.clear();
@@ -2044,63 +2388,1249 @@ public:
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
     }
 
+    // =========================================================================================
+    // Multiplayer
+    // =========================================================================================
+
+    bool is_beast() const { return mode != Mode::Single && in_round && my_slot == 3; }
+
+    // True while a person is driving the Beast's boss, so the host's AI must leave it alone.
+    bool beast_active() const {
+        return mode != Mode::Single && in_round && beast_boss_id >= 0 && (lobby_mask & (1 << 3)) != 0;
+    }
+
+    int player_count() const {
+        int n = 0;
+        for (int s = 1; s <= 3; s++) if (lobby_mask & (1 << s)) n++;
+        return n;
+    }
+
+    static std::string player_name(int slot) { return slot == 3 ? "the Beast" : "Player " + std::to_string(slot); }
+
+    static std::string capitalised(std::string s) {
+        if (!s.empty() && s[0] >= 'a' && s[0] <= 'z') s[0] = static_cast<char>(s[0] - 'a' + 'A');
+        return s;
+    }
+
+    static glm::vec4 player_color(int slot) {
+        switch (slot) {
+        case 1:  return { 0.40f, 1.00f, 0.50f, 1.0f }; // green
+        case 2:  return { 0.45f, 0.75f, 1.00f, 1.0f }; // blue
+        default: return { 0.85f, 0.45f, 1.00f, 1.0f }; // purple, the Beast
+        }
+    }
+
+    std::string death_text(int victim, int killer) const {
+        std::string who = victim == my_slot ? "You" : capitalised(player_name(victim));
+        std::string verb = victim == my_slot ? " were killed by " : " was killed by ";
+        if (killer == 0) return who + verb + "a monster";
+        if (killer == my_slot) return who + verb + "you";
+        return who + verb + player_name(killer);
+    }
+
+    void add_feed(const std::string& text) {
+        feed.push_back({ text, glfwGetTime() + 5.0 });
+        if (feed.size() > 4) feed.erase(feed.begin());
+        log("[feed] " + text);
+    }
+
+    // Test aid: write the frame just drawn to a .bmp (bottom-up rows, which BMP expects anyway).
+    void save_screenshot(const std::string& path) {
+        int w = screen_width, h = screen_height;
+        int row = (w * 3 + 3) & ~3;
+        std::vector<unsigned char> px(static_cast<size_t>(row) * h);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadBuffer(GL_BACK);
+        glReadPixels(0, 0, w, h, GL_BGR, GL_UNSIGNED_BYTE, px.data());
+        std::ofstream f(path, std::ios::binary);
+        if (!f) return;
+        uint32_t data_size = static_cast<uint32_t>(px.size());
+        unsigned char hdr[54] = { 'B', 'M' };
+        auto put32 = [&](int o, uint32_t v) { for (int i = 0; i < 4; i++) hdr[o + i] = static_cast<unsigned char>(v >> (8 * i)); };
+        put32(2, 54 + data_size); put32(10, 54); put32(14, 40);
+        put32(18, static_cast<uint32_t>(w)); put32(22, static_cast<uint32_t>(h));
+        hdr[26] = 1; hdr[28] = 24; put32(34, data_size);
+        f.write(reinterpret_cast<const char*>(hdr), 54);
+        f.write(reinterpret_cast<const char*>(px.data()), static_cast<std::streamsize>(px.size()));
+        log("[test] screenshot saved to " + path);
+    }
+
+    static void log(const std::string& line) { std::cout << line << std::endl; }
+
+    // The explorer a monster at (mx, my) shoots at: the nearest living one on the maze level.
+    // In singleplayer that's simply you, as before.
+    bool nearest_target(double mx, double my, double& tx, double& ty) {
+        double best = 1e18;
+        bool found = false;
+        auto consider = [&](double x, double y) {
+            double d = std::hypot(x - mx, y - my);
+            if (d > 0.0 && d < best) { best = d; tx = x; ty = y; found = true; }
+        };
+        if (!is_beast() && player_level == 0 && !showing_die) consider(player_pos_x, player_pos_y);
+        if (mode != Mode::Single) {
+            for (int s = 1; s <= 2; s++) {
+                if (s == my_slot) continue;
+                const RemotePlayer& r = remote[s];
+                if (r.present && r.has_state && r.alive && r.level == 0) consider(r.x, r.y);
+            }
+        }
+        return found;
+    }
+
+    // A fingerprint of the generated world. Every player logs it when a round starts, so a
+    // mismatch - two machines building different mazes from one seed - is easy to spot.
+    uint64_t world_checksum() const {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&h](int64_t v) { h ^= static_cast<uint64_t>(v); h *= 1099511628211ull; };
+        auto mix_conn = [&](const std::map<std::pair<int, int>, std::set<std::pair<int, int>>>& conn) {
+            for (const auto& [cell, links] : conn) {
+                if (links.empty()) continue; // empty entries only exist from lookups, not layout
+                mix(cell.first * 64 + cell.second);
+                for (const auto& n : links) mix(10000 + n.first * 64 + n.second);
+            }
+        };
+        for (const auto& row : grid) for (int c : row) mix(c);
+        mix_conn(connections);
+        mix_conn(lower_connections);
+        mix(start.first); mix(start.second); mix(end.first); mix(end.second);
+        for (const auto& m : monsters) {
+            mix(m.id); mix(m.type); mix(m.hp);
+            mix(std::llround(m.x * 1000.0)); mix(std::llround(m.y * 1000.0));
+        }
+        for (const auto& p : health_packs) {
+            mix(p.id); mix(p.level);
+            mix(std::llround(p.x * 1000.0)); mix(std::llround(p.y * 1000.0));
+        }
+        return h;
+    }
+
+    // ---- Sending ----------------------------------------------------------------------------
+
+    // Host: to every client. Client: to the host, which relays it to everyone else.
+    void send_msg(const std::vector<uint8_t>& msg, bool reliable) {
+        if (mode == Mode::Host) net.broadcast(msg, reliable);
+        else if (mode == Mode::Client) net.send_to_host(msg, reliable);
+    }
+
+    void send_shot(const Projectile& p) {
+        if (mode == Mode::Single || !in_round) return;
+        net::Writer w;
+        w.put<uint8_t>(MSG_SHOT).put<uint8_t>(round_id).put<uint8_t>(static_cast<uint8_t>(p.owner))
+         .put<uint8_t>(static_cast<uint8_t>(p.level)).put<uint8_t>(p.from_boss ? 1 : 0)
+         .put<float>(static_cast<float>(p.x)).put<float>(static_cast<float>(p.y)).put<float>(static_cast<float>(p.z))
+         .put<float>(static_cast<float>(p.dir_x)).put<float>(static_cast<float>(p.dir_y))
+         .put<float>(static_cast<float>(p.dir_z)).put<float>(static_cast<float>(p.speed));
+        send_msg(w.buf, true);
+    }
+
+    void send_monster_hit(int id, int dmg) {
+        net::Writer w;
+        w.put<uint8_t>(MSG_MONSTER_HIT).put<uint8_t>(round_id).put<int32_t>(id).put<int32_t>(dmg);
+        net.send_to_host(w.buf, true);
+    }
+
+    void send_state() {
+        uint8_t flags = (!showing_die && !spectating) ? 1 : 0; // bit 0: alive
+        net::Writer w;
+        w.put<uint8_t>(MSG_STATE).put<uint8_t>(round_id).put<uint8_t>(static_cast<uint8_t>(my_slot))
+         .put<uint8_t>(static_cast<uint8_t>(player_level)).put<uint8_t>(flags)
+         .put<float>(static_cast<float>(player_pos_x)).put<float>(static_cast<float>(player_pos_y))
+         .put<float>(static_cast<float>(jump_height)).put<float>(static_cast<float>(yaw))
+         .put<float>(static_cast<float>(pitch)).put<int16_t>(static_cast<int16_t>(std::clamp(player_hp, -999, 999)));
+        send_msg(w.buf, false);
+    }
+
+    // Host: where every monster is, 20 times a second. Unreliable on purpose - each snapshot
+    // is complete, so a lost one is simply replaced by the next.
+    void send_monsters() {
+        size_t n = std::min<size_t>(monsters.size(), 512);
+        net::Writer w;
+        w.put<uint8_t>(MSG_MONSTERS).put<uint8_t>(round_id).put<uint16_t>(static_cast<uint16_t>(n));
+        for (size_t i = 0; i < n; i++) {
+            const Monster& m = monsters[i];
+            w.put<int32_t>(m.id).put<float>(static_cast<float>(m.x)).put<float>(static_cast<float>(m.y))
+             .put<int32_t>(m.hp).put<uint8_t>(static_cast<uint8_t>(m.type))
+             .put<uint8_t>(static_cast<uint8_t>(std::clamp(m.hit_flash, 0, 255)));
+        }
+        net.broadcast(w.buf, false);
+    }
+
+    void send_periodic(double delta) {
+        state_timer -= delta;
+        if (state_timer <= 0.0) { state_timer = STATE_INTERVAL; send_state(); }
+        if (mode == Mode::Host) {
+            monster_timer -= delta;
+            if (monster_timer <= 0.0) { monster_timer = MONSTER_INTERVAL; send_monsters(); }
+        }
+    }
+
+    void broadcast_lobby() {
+        net::Writer w;
+        w.put<uint8_t>(MSG_LOBBY).put<uint8_t>(lobby_mask);
+        net.broadcast(w.buf, true);
+    }
+
+    // ---- Receiving --------------------------------------------------------------------------
+
+    void pump_network() {
+        if (!net.active()) return;
+        for (const auto& e : net.poll()) {
+            if (!net.active()) break; // a handler below may have ended the session
+            switch (e.type) {
+            case net::Event::Type::Connected:    on_peer_connected(); break;
+            case net::Event::Type::Disconnected: on_peer_disconnected(e.peer); break;
+            case net::Event::Type::Received:
+                if (mode == Mode::Host) host_receive(e.peer, e.data);
+                else client_receive(e.data);
+                break;
+            }
+        }
+    }
+
+    int slot_of_peer(int peer) const {
+        for (int s = 2; s <= 3; s++) if (slot_peer[s] == peer) return s;
+        return -1;
+    }
+
+    void on_peer_connected() {
+        // The host waits for this HELLO before it hands out a slot.
+        if (mode != Mode::Client) return;
+        net::Writer w;
+        w.put<uint8_t>(MSG_HELLO).put<uint8_t>(PROTOCOL_VERSION);
+        net.send_to_host(w.buf, true);
+        menu_status = "Connected. Joining...";
+        menu_status_error = false;
+    }
+
+    void on_peer_disconnected(int peer) {
+        if (mode == Mode::Client) {
+            if (!join_connected) {
+                // No Connected ever arrived: nobody answered at that address.
+                leave_multiplayer("Could not reach " + join_address + " on UDP port "
+                                  + std::to_string(net::DEFAULT_PORT) + ".");
+            }
+            else {
+                leave_multiplayer("The host closed the game.");
+                open_menu(Screen::Main);
+            }
+            return;
+        }
+        if (mode != Mode::Host) return;
+        int slot = slot_of_peer(peer);
+        if (slot < 0) return; // never finished joining
+        slot_peer[slot] = -1;
+        remote[slot] = RemotePlayer{};
+        lobby_mask = static_cast<uint8_t>(lobby_mask & ~(1 << slot));
+        log("[net] player " + std::to_string(slot) + " left");
+        if (in_round) {
+            add_feed(capitalised(player_name(slot)) + " left the game");
+            if (slot == 3 && beast_boss_id >= 0) {
+                // Nobody drives that boss any more: hand it back to its AI.
+                beast_boss_id = -1;
+                net::Writer w;
+                w.put<uint8_t>(MSG_BEAST_BOSS).put<uint8_t>(round_id).put<int32_t>(-1);
+                net.broadcast(w.buf, true);
+            }
+        }
+        else if (slot == 2 && slot_peer[3] >= 0) {
+            // Keep a Player 2 so the host can still start: whoever was Player 3 moves up.
+            int p = slot_peer[3];
+            slot_peer[3] = -1;
+            slot_peer[2] = p;
+            remote[2] = remote[3];
+            remote[3] = RemotePlayer{};
+            lobby_mask = static_cast<uint8_t>((lobby_mask & ~(1 << 3)) | (1 << 2));
+            net::Writer w;
+            w.put<uint8_t>(MSG_ASSIGN).put<uint8_t>(2);
+            net.send(p, w.buf, true);
+        }
+        broadcast_lobby();
+    }
+
+    // Reads a STATE message into remote[slot]. expected_slot is the sender's slot on the host
+    // (so nobody can move someone else) and -1 on a client, which trusts the host's relay.
+    bool read_state(net::Reader& r, int expected_slot) {
+        int slot = r.get<uint8_t>();
+        int level = r.get<uint8_t>();
+        uint8_t flags = r.get<uint8_t>();
+        float x = r.get<float>(), y = r.get<float>(), jump = r.get<float>();
+        float yw = r.get<float>(), pt = r.get<float>();
+        int hp = r.get<int16_t>();
+        if (!r.ok || slot < 1 || slot > 3 || slot == my_slot) return false;
+        if (expected_slot >= 0 && slot != expected_slot) return false;
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(jump) || !std::isfinite(yw) || !std::isfinite(pt)) return false;
+        x = std::clamp(x, 0.0f, static_cast<float>(grid_size) - 0.001f);
+        y = std::clamp(y, 0.0f, static_cast<float>(grid_size) - 0.001f);
+        RemotePlayer& p = remote[slot];
+        bool teleport = !p.has_state || (level != 0) != (p.level != 0) || std::hypot(x - p.x, y - p.y) > 2.0;
+        bool alive = (flags & 1) != 0;
+        if (p.has_state && alive && hp < p.hp) p.flash_until = glfwGetTime() + 0.15;
+        p.x = x; p.y = y;
+        if (teleport) { p.rx = x; p.ry = y; }
+        p.jump = std::clamp(jump, 0.0f, 1.0f);
+        p.yaw = yw; p.pitch = pt;
+        p.level = level != 0 ? 1 : 0;
+        p.hp = hp;
+        p.alive = alive;
+        p.present = true;
+        p.has_state = true;
+        if (!p.logged) { p.logged = true; log("[mp] receiving " + player_name(slot) + "'s position"); }
+        // The host drives the Beast's boss from Player 3's reported position.
+        if (mode == Mode::Host && slot == 3 && beast_boss_id >= 0) {
+            if (Monster* m = find_monster(beast_boss_id)) {
+                m->net_x = x; m->net_y = y;
+                if (teleport) { m->x = x; m->y = y; }
+            }
+        }
+        return true;
+    }
+
+    bool read_shot(net::Reader& r, int expected_owner) {
+        Projectile p;
+        int owner = r.get<uint8_t>();
+        p.level = r.get<uint8_t>() ? 1 : 0;
+        p.from_boss = r.get<uint8_t>() != 0;
+        float v[7];
+        for (float& f : v) f = r.get<float>();
+        if (!r.ok || owner > 3 || owner == my_slot) return false;
+        if (expected_owner >= 0 && owner != expected_owner) return false;
+        for (float f : v) if (!std::isfinite(f)) return false;
+        p.x = std::clamp(v[0], 0.0f, static_cast<float>(grid_size)); p.y = std::clamp(v[1], 0.0f, static_cast<float>(grid_size));
+        p.z = v[2];
+        p.dir_x = v[3]; p.dir_y = v[4]; p.dir_z = v[5];
+        p.speed = std::clamp(v[6], 0.01f, 1.0f);
+        p.owner = owner;
+        // Monster and Beast shots behave like monster shots; the explorers' like player shots.
+        if (owner == 0 || owner == 3) monster_projectiles.push_back(p);
+        else projectiles.push_back(p);
+        if (!logged_shot[owner]) {
+            logged_shot[owner] = true;
+            log(std::string("[mp] shot received from ") + (owner == 0 ? "a monster" : player_name(owner)));
+        }
+        return true;
+    }
+
+    // Replace the monster list with the host's snapshot. Known monsters keep their drawn
+    // position and glide toward the new one; ones missing from the snapshot are dead.
+    void read_snapshot(net::Reader& r) {
+        int n = r.get<uint16_t>();
+        if (!r.ok || n > 512) return;
+        std::vector<Monster> next;
+        next.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; i++) {
+            int id = r.get<int32_t>();
+            float x = r.get<float>(), y = r.get<float>();
+            int hp = r.get<int32_t>();
+            int type = r.get<uint8_t>();
+            int flash = r.get<uint8_t>();
+            if (!r.ok || !std::isfinite(x) || !std::isfinite(y)) return;
+            Monster m{};
+            if (const Monster* old = find_monster(id)) m = *old;
+            else { m.x = x; m.y = y; m.target_x = x; m.target_y = y; }
+            m.id = id;
+            m.net_x = std::clamp(x, 0.0f, static_cast<float>(grid_size));
+            m.net_y = std::clamp(y, 0.0f, static_cast<float>(grid_size));
+            m.hp = hp;
+            m.type = type == 2 ? 2 : 1;
+            m.hit_flash = std::max(m.hit_flash, flash);
+            next.push_back(m);
+        }
+        monsters.swap(next);
+        if (!logged_snapshot) {
+            logged_snapshot = true;
+            log("[mp] first monster snapshot: " + std::to_string(monsters.size()) + " monsters, "
+                + std::to_string(boss_count()) + " bosses");
+        }
+    }
+
+    void remove_pack(int id) {
+        health_packs.erase(std::remove_if(health_packs.begin(), health_packs.end(),
+                           [id](const HealthPack& h) { return h.id == id; }), health_packs.end());
+    }
+
+    void host_receive(int peer, const std::vector<uint8_t>& data) {
+        net::Reader r(data);
+        uint8_t type = r.get<uint8_t>();
+        int slot = slot_of_peer(peer);
+
+        if (type == MSG_HELLO) {
+            uint8_t version = r.get<uint8_t>();
+            if (slot >= 0) return; // already joined
+            uint8_t reason = 0;
+            int free_slot = slot_peer[2] < 0 ? 2 : (slot_peer[3] < 0 ? 3 : -1);
+            if (!r.ok || version != PROTOCOL_VERSION) reason = REJECT_VERSION;
+            else if (in_round) reason = REJECT_IN_PROGRESS;
+            else if (free_slot < 0) reason = REJECT_FULL;
+            if (reason) {
+                net::Writer w;
+                w.put<uint8_t>(MSG_REJECT).put<uint8_t>(reason);
+                net.send(peer, w.buf, true);
+                net.drop(peer);
+                log("[net] turned away a player (reason " + std::to_string(reason) + ")");
+                return;
+            }
+            slot_peer[free_slot] = peer;
+            lobby_mask = static_cast<uint8_t>(lobby_mask | (1 << free_slot));
+            remote[free_slot] = RemotePlayer{};
+            remote[free_slot].present = true;
+            net::Writer w;
+            w.put<uint8_t>(MSG_WELCOME).put<uint8_t>(static_cast<uint8_t>(free_slot)).put<uint32_t>(round_seed);
+            net.send(peer, w.buf, true);
+            broadcast_lobby();
+            log("[net] player " + std::to_string(free_slot) + " joined (" + std::to_string(player_count()) + "/3)");
+            return;
+        }
+
+        if (slot < 0) return; // hasn't said hello yet
+        uint8_t rnd = r.get<uint8_t>();
+        if (!r.ok || !in_round || rnd != round_id) return; // from a previous maze, or no round yet
+
+        switch (type) {
+        case MSG_STATE:
+            if (read_state(r, slot)) net.broadcast(data, false, peer);
+            break;
+        case MSG_SHOT:
+            if (read_shot(r, slot)) net.broadcast(data, true, peer);
+            break;
+        case MSG_MONSTER_HIT: {
+            int id = r.get<int32_t>();
+            int dmg = r.get<int32_t>();
+            if (r.ok && dmg > 0 && dmg <= 300) apply_monster_damage(id, dmg);
+            break;
+        }
+        case MSG_DEATH: {
+            int victim = r.get<uint8_t>();
+            int killer = r.get<uint8_t>();
+            if (!r.ok || victim != slot || killer > 3) break;
+            net.broadcast(data, true, peer);
+            add_feed(death_text(victim, killer));
+            remote[victim].alive = false;
+            break;
+        }
+        case MSG_PICKUP: {
+            int id = r.get<int32_t>();
+            if (!r.ok) break;
+            bool exists = std::any_of(health_packs.begin(), health_packs.end(), [id](const HealthPack& h) { return h.id == id; });
+            if (!exists) break; // someone got there first
+            remove_pack(id);
+            net::Writer w;
+            w.put<uint8_t>(MSG_PACK_GONE).put<uint8_t>(round_id).put<int32_t>(id);
+            net.broadcast(w.buf, true);
+            break;
+        }
+        case MSG_REACHED_EXIT: {
+            int who = r.get<uint8_t>();
+            // The host has the final say on whether every boss is really dead.
+            if (r.ok && who == slot && !round_over && boss_count() == 0) end_round(slot);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    void client_receive(const std::vector<uint8_t>& data) {
+        net::Reader r(data);
+        uint8_t type = r.get<uint8_t>();
+        switch (type) {
+        case MSG_WELCOME: {
+            int slot = r.get<uint8_t>();
+            uint32_t seed = r.get<uint32_t>();
+            if (!r.ok || slot < 2 || slot > 3) return;
+            my_slot = slot;
+            round_seed = seed;
+            join_connecting = false;
+            join_connected = true;
+            menu_status.clear();
+            lobby_mask = static_cast<uint8_t>(lobby_mask | 1 | (1 << slot));
+            glfwSetWindowTitle(window, ("MazeBeasts - Player " + std::to_string(slot)).c_str());
+            log("[net] joined as player " + std::to_string(slot));
+            return;
+        }
+        case MSG_REJECT: {
+            int reason = r.get<uint8_t>();
+            std::string why = reason == REJECT_IN_PROGRESS ? "That game has already started."
+                            : reason == REJECT_FULL ? "That game is full (3 players)."
+                            : "That host is running a different version of MazeBeasts.";
+            leave_multiplayer(why);
+            return;
+        }
+        case MSG_ASSIGN: {
+            int slot = r.get<uint8_t>();
+            if (!r.ok || slot < 2 || slot > 3) return;
+            my_slot = slot;
+            glfwSetWindowTitle(window, ("MazeBeasts - Player " + std::to_string(slot)).c_str());
+            log("[net] now player " + std::to_string(slot));
+            return;
+        }
+        case MSG_LOBBY: {
+            uint8_t mask = r.get<uint8_t>();
+            if (!r.ok) return;
+            if (in_round) {
+                for (int s = 1; s <= 3; s++) {
+                    if (s != my_slot && (lobby_mask & (1 << s)) && !(mask & (1 << s))) {
+                        add_feed(capitalised(player_name(s)) + " left the game");
+                        remote[s] = RemotePlayer{};
+                    }
+                }
+            }
+            lobby_mask = mask;
+            return;
+        }
+        case MSG_START: {
+            uint8_t rnd = r.get<uint8_t>();
+            uint32_t seed = r.get<uint32_t>();
+            int beast = r.get<int32_t>();
+            uint8_t mask = r.get<uint8_t>();
+            if (!r.ok || !join_connected) return;
+            round_id = rnd;
+            round_seed = seed;
+            lobby_mask = mask;
+            new_maze(seed, true);
+            beast_boss_id = beast;
+            begin_round_local();
+            return;
+        }
+        default:
+            break;
+        }
+
+        // Everything else belongs to the current round.
+        uint8_t rnd = r.get<uint8_t>();
+        if (!r.ok || !in_round || rnd != round_id) return;
+        switch (type) {
+        case MSG_STATE:    read_state(r, -1); break;
+        case MSG_SHOT:     read_shot(r, -1); break;
+        case MSG_MONSTERS: read_snapshot(r); break;
+        case MSG_DEATH: {
+            int victim = r.get<uint8_t>();
+            int killer = r.get<uint8_t>();
+            if (!r.ok || victim < 1 || victim > 3 || victim == my_slot) break;
+            add_feed(death_text(victim, killer));
+            remote[victim].alive = false;
+            break;
+        }
+        case MSG_PACK_GONE: {
+            int id = r.get<int32_t>();
+            if (r.ok) remove_pack(id);
+            break;
+        }
+        case MSG_ROUND_OVER: {
+            int winner = r.get<uint8_t>();
+            if (!r.ok) break;
+            round_over = true;
+            round_winner = winner;
+            round_over_until = glfwGetTime() + ROUND_OVER_SECONDS;
+            log("[mp] round over, won by " + player_name(winner));
+            break;
+        }
+        case MSG_BEAST_BOSS: {
+            int id = r.get<int32_t>();
+            if (!r.ok) break;
+            beast_boss_id = id;
+            if (my_slot == 3) take_beast_control();
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // ---- Sessions and rounds ------------------------------------------------------------------
+
+    void begin_hosting() {
+        std::string err;
+        if (!net.start_host(net::DEFAULT_PORT, 2, err)) {
+            menu_status = err;
+            menu_status_error = true;
+            open_menu(Screen::Main);
+            log("[net] " + err);
+            return;
+        }
+        mode = Mode::Host;
+        my_slot = 1;
+        lobby_mask = 1 << 1;
+        in_round = false;
+        round_id = 0;
+        for (auto& p : remote) p = RemotePlayer{};
+        for (int& p : slot_peer) p = -1;
+        round_seed = random_seed(); // shown in the lobby; the first round uses it
+        host_ips = net.local_ipv4_addresses();
+        menu_status.clear();
+        menu_status_error = false;
+        open_menu(Screen::Host);
+        glfwSetWindowTitle(window, "MazeBeasts - Player 1 (host)");
+        log("[net] hosting on UDP port " + std::to_string(net::DEFAULT_PORT) + ", maze seed " + std::to_string(round_seed));
+    }
+
+    void begin_join() {
+        std::string err;
+        if (!net.start_client(join_address, net::DEFAULT_PORT, err)) {
+            menu_status = err;
+            menu_status_error = true;
+            log("[net] " + err);
+            return;
+        }
+        mode = Mode::Client;
+        in_round = false;
+        join_connecting = true;
+        join_connected = false;
+        lobby_mask = 1 << 1;
+        for (auto& p : remote) p = RemotePlayer{};
+        menu_status = "Connecting to " + join_address + ":" + std::to_string(net::DEFAULT_PORT) + "...";
+        menu_status_error = false;
+        log("[net] connecting to " + join_address + ":" + std::to_string(net::DEFAULT_PORT));
+    }
+
+    // Back to singleplayer: close the connection, and if a multiplayer maze was in play, give
+    // the player a fresh solo one - a shared maze isn't a singleplayer game.
+    void leave_multiplayer(const std::string& why) {
+        bool had_round = mode != Mode::Single && in_round;
+        net.stop();
+        mode = Mode::Single;
+        my_slot = 1;
+        in_round = false;
+        round_over = false;
+        spectating = false;
+        beast_boss_id = -1;
+        lobby_mask = 1 << 1;
+        join_connecting = false;
+        join_connected = false;
+        for (auto& p : remote) p = RemotePlayer{};
+        for (int& p : slot_peer) p = -1;
+        feed.clear();
+        if (had_round) new_maze(random_seed(), true);
+        glfwSetWindowTitle(window, "MazeBeasts - 3D");
+        menu_status = why;
+        menu_status_error = !why.empty();
+        if (!why.empty()) log("[net] " + why);
+    }
+
+    void host_start_round() {
+        if (mode != Mode::Host) return;
+        if (round_id > 0) round_seed = random_seed(); // later rounds get a fresh maze
+        round_id++;
+        new_maze(round_seed, true);
+        beast_boss_id = -1;
+        if (slot_peer[3] >= 0) {
+            std::vector<int> bosses;
+            for (const auto& m : monsters) if (m.type == 2) bosses.push_back(m.id);
+            if (!bosses.empty())
+                beast_boss_id = bosses[std::uniform_int_distribution<size_t>(0, bosses.size() - 1)(rng)];
+        }
+        net::Writer w;
+        w.put<uint8_t>(MSG_START).put<uint8_t>(round_id).put<uint32_t>(round_seed)
+         .put<int32_t>(beast_boss_id).put<uint8_t>(lobby_mask);
+        net.broadcast(w.buf, true);
+        begin_round_local();
+    }
+
+    void begin_round_local() {
+        in_round = true;
+        round_over = false;
+        round_winner = 0;
+        exit_reported = false;
+        spectating = false;
+        logged_snapshot = false;
+        for (bool& b : logged_shot) b = false;
+        killed_by = 0;
+        last_damage_by = 0;
+        for (int s = 1; s <= 3; s++) {
+            remote[s] = RemotePlayer{};
+            remote[s].present = s != my_slot && (lobby_mask & (1 << s)) != 0;
+        }
+        feed.clear();
+        state_timer = 0.0;
+        monster_timer = 0.0;
+        if (my_slot == 3) take_beast_control();
+        if (screen != Screen::None) close_menu();
+        log("[mp] round " + std::to_string(round_id) + " started as player " + std::to_string(my_slot)
+            + ": seed " + std::to_string(round_seed) + ", world checksum " + std::to_string(world_checksum())
+            + ", " + std::to_string(boss_count()) + " bosses, Beast boss id " + std::to_string(beast_boss_id));
+    }
+
+    // Player 3 becomes the boss they've been given: the camera moves into it.
+    void take_beast_control() {
+        const Monster* m = find_monster(beast_boss_id);
+        if (!m) {
+            spectating = true;
+            log("[mp] no boss left to control - spectating");
+            return;
+        }
+        spectating = false;
+        player_pos_x = m->x;
+        player_pos_y = m->y;
+        player_level = 0;
+        jump_height = 0.0;
+        jump_velocity = 0.0;
+        face(open_facing_yaw({ static_cast<int>(m->x), static_cast<int>(m->y) }));
+        log("[mp] controlling boss " + std::to_string(beast_boss_id));
+    }
+
+    // Host: the Beast's boss died. Give Player 3 another living boss, if there is one.
+    void reassign_beast() {
+        beast_boss_id = -1;
+        if (slot_peer[3] >= 0) {
+            std::vector<int> bosses;
+            for (const auto& m : monsters) if (m.type == 2) bosses.push_back(m.id);
+            if (!bosses.empty()) {
+                beast_boss_id = bosses[std::uniform_int_distribution<size_t>(0, bosses.size() - 1)(rng)];
+                if (Monster* m = find_monster(beast_boss_id)) { m->net_x = m->x; m->net_y = m->y; }
+            }
+        }
+        net::Writer w;
+        w.put<uint8_t>(MSG_BEAST_BOSS).put<uint8_t>(round_id).put<int32_t>(beast_boss_id);
+        net.broadcast(w.buf, true);
+        log("[mp] the Beast's boss died; now controlling boss " + std::to_string(beast_boss_id));
+    }
+
+    void end_round(int winner) {
+        round_over = true;
+        round_winner = winner;
+        round_over_until = glfwGetTime() + ROUND_OVER_SECONDS;
+        net::Writer w;
+        w.put<uint8_t>(MSG_ROUND_OVER).put<uint8_t>(round_id).put<uint8_t>(static_cast<uint8_t>(winner));
+        net.broadcast(w.buf, true);
+        log("[mp] round over, won by " + player_name(winner));
+    }
+
+    void smooth_remote_players(double delta) {
+        double k = std::min(1.0, delta * 15.0);
+        for (auto& r : remote) {
+            if (!r.has_state) continue;
+            r.rx += (r.x - r.rx) * k;
+            r.ry += (r.y - r.ry) * k;
+        }
+    }
+
+    // Clients don't run monster AI; they glide monsters toward the host's latest snapshot.
+    void smooth_monsters(double delta) {
+        double k = std::min(1.0, delta * 12.0);
+        for (auto& m : monsters) {
+            m.x += (m.net_x - m.x) * k;
+            m.y += (m.net_y - m.y) * k;
+            if (m.hit_flash > 0) m.hit_flash--;
+        }
+    }
+
+    // =========================================================================================
+    // Menu
+    // =========================================================================================
+
+    struct Button { std::string label; MenuAction action; bool enabled; };
+
+    void set_mouse_captured(bool captured) {
+        if (opts.test) captured = false; // test copies never grab the mouse
+        glfwSetInputMode(window, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+        first_mouse = true; // no view jump from wherever the cursor wandered meanwhile
+    }
+
+    void open_menu(Screen s) {
+        bool was_closed = screen == Screen::None;
+        screen = s;
+        menu_focus = 0;
+        if (was_closed) {
+            set_mouse_captured(false);
+            int ww, wh;
+            glfwGetWindowSize(window, &ww, &wh);
+            glfwSetCursorPos(window, ww / 2.0, wh / 2.0);
+        }
+        // Don't let a key or button that's already down count as a fresh press in the menu.
+        click_prev = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+        enter_prev = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_KP_ENTER) == GLFW_PRESS;
+        up_prev = glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS;
+        down_prev = glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS;
+        typed.clear();
+        backspaces = 0;
+    }
+
+    void close_menu() {
+        screen = Screen::None;
+        set_mouse_captured(true);
+        fire_pressed = true; // the click that closed the menu must not also fire a shot
+    }
+
+    void handle_escape() {
+        bool down = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+        if (down && !esc_pressed) {
+            switch (screen) {
+            case Screen::None: open_menu(Screen::Main); break;
+            case Screen::Main: close_menu(); break;
+            case Screen::Host: menu_action(MenuAction::CancelHost); break;
+            case Screen::Join: menu_action(MenuAction::BackFromJoin); break;
+            }
+        }
+        esc_pressed = down;
+    }
+
+    void menu_action(MenuAction a) {
+        switch (a) {
+        case MenuAction::Single:
+            if (mode != Mode::Single) leave_multiplayer("");
+            close_menu();
+            break;
+        case MenuAction::Join:
+            if (mode != Mode::Single) leave_multiplayer("");
+            menu_status.clear();
+            menu_status_error = false;
+            open_menu(Screen::Join);
+            break;
+        case MenuAction::Host:
+            if (mode != Mode::Single) leave_multiplayer("");
+            begin_hosting();
+            break;
+        case MenuAction::Exit:
+            glfwSetWindowShouldClose(window, true);
+            break;
+        case MenuAction::StartGame:
+            host_start_round();
+            break;
+        case MenuAction::CancelHost:
+        case MenuAction::BackFromJoin:
+            leave_multiplayer("");
+            open_menu(Screen::Main);
+            break;
+        case MenuAction::Connect:
+            begin_join();
+            break;
+        default:
+            break;
+        }
+    }
+
+    float text_width(const std::string& text, float scale) const {
+        float w = 0.0f;
+        for (char c : text) if (c >= 32 && c < 127) w += cdata[c - 32].xadvance * scale;
+        return w;
+    }
+
+    void draw_text_centered(const std::string& text, float cx, float y, glm::vec4 color, float scale = 1.0f) {
+        draw_text(text, cx - text_width(text, scale) * 0.5f, y, color, scale);
+    }
+
+    // An immediate-mode menu: laid out, drawn and clicked in one pass each frame. The page is
+    // described first and then scaled to fit, so every line and button shows in a small window
+    // as well as on a big screen.
+    void render_menu() {
+        glViewport(0, 0, screen_width, screen_height);
+        glm::mat4 projection = glm::ortho(0.0f, static_cast<float>(screen_width), static_cast<float>(screen_height), 0.0f, -1.0f, 1.0f);
+        glm::mat4 id = glm::mat4(1.0f);
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "view"), 1, GL_FALSE, glm::value_ptr(id));
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(id));
+        glDisable(GL_DEPTH_TEST);
+
+        const float W = static_cast<float>(screen_width), H = static_cast<float>(screen_height);
+        const float cx = W * 0.5f;
+        const glm::vec4 bright = { 1.0f, 1.0f, 1.0f, 1.0f }, dim = { 0.72f, 0.76f, 0.84f, 1.0f };
+        const glm::vec4 good = { 0.50f, 1.00f, 0.60f, 1.0f }, bad = { 1.00f, 0.45f, 0.40f, 1.0f };
+        const glm::vec4 gold = { 0.95f, 0.78f, 0.30f, 1.0f };
+        const std::string port = std::to_string(net::DEFAULT_PORT);
+
+        // ---- Describe the page -------------------------------------------------------------
+        enum ItemKind { TEXT, INPUT, GAP };
+        struct Item { ItemKind kind; std::string text; glm::vec4 color; float scale; float height; };
+        std::vector<Item> items;
+        auto text = [&](const std::string& s, glm::vec4 c) { items.push_back({ TEXT, s, c, 0.75f, 32.0f }); };
+        auto gap = [&](float h) { items.push_back({ GAP, "", {}, 0.0f, h }); };
+        items.push_back({ TEXT, "MAZE BEASTS", gold, 1.6f, 76.0f });
+
+        std::vector<Button> buttons;
+        std::string hint;
+        bool editable = false;
+
+        if (screen == Screen::Main) {
+            buttons = { { "Singleplayer", MenuAction::Single, true },
+                        { "Multiplayer - Join", MenuAction::Join, true },
+                        { "Multiplayer - Host", MenuAction::Host, true },
+                        { "Exit", MenuAction::Exit, true } };
+            hint = mode == Mode::Single ? "Esc: back to the game"
+                                        : "Esc: back to the game.  Choosing another option leaves this multiplayer game.";
+        }
+        else if (screen == Screen::Host) {
+            text("Hosting on UDP port " + port, bright);
+            text("Maze seed: " + std::to_string(round_seed), dim);
+            std::string ips;
+            for (const auto& ip : host_ips) ips += (ips.empty() ? "" : ", ") + ip;
+            text("Other players join with: " + (ips.empty() ? std::string("your IP address") : ips), dim);
+            text("(or 127.0.0.1 from another copy on this PC)", dim);
+            gap(10.0f);
+            int n = player_count();
+            text(n <= 1 ? "Waiting for players..." : std::to_string(n) + "/3 players joined", n >= 2 ? good : bright);
+            text("Player 1: you (host)", player_color(1));
+            text((lobby_mask & (1 << 2)) ? "Player 2: joined" : "Player 2: waiting...",
+                 (lobby_mask & (1 << 2)) ? player_color(2) : dim);
+            text((lobby_mask & (1 << 3)) ? "Player 3: joined - will control a boss" : "Player 3 (optional): controls a boss",
+                 (lobby_mask & (1 << 3)) ? player_color(3) : dim);
+            buttons = { { "Start the game", MenuAction::StartGame, (lobby_mask & (1 << 2)) != 0 },
+                        { "Cancel", MenuAction::CancelHost, true } };
+            hint = "Esc: stop hosting";
+        }
+        else if (screen == Screen::Join) {
+            editable = !join_connecting && !join_connected;
+            if (editable) {
+                for (char c : typed) {
+                    bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == '-';
+                    if (ok && join_address.size() < 64) join_address.push_back(c);
+                }
+                for (int i = 0; i < backspaces && !join_address.empty(); i++) join_address.pop_back();
+            }
+            text("Host IP address:", bright);
+            items.push_back({ INPUT, join_address, bright, 0.9f, 60.0f });
+            text("Port " + port + " (UDP)", dim);
+            gap(6.0f);
+            if (join_connected) {
+                text("Connected as " + capitalised(player_name(my_slot))
+                     + (my_slot == 2 ? " - you start at the exit" : " - you'll control a boss"), player_color(my_slot));
+                text("Waiting for the host to start the game (" + std::to_string(player_count()) + "/3 players)", dim);
+            }
+            buttons = { { "Connect", MenuAction::Connect, editable && !join_address.empty() },
+                        { "Back", MenuAction::BackFromJoin, true } };
+            hint = editable ? "Type the host's IP address, then press Enter" : "Esc: leave";
+        }
+        if (!menu_status.empty()) text(menu_status, menu_status_error ? bad : dim);
+        gap(10.0f);
+
+        // ---- Fit it to the window ----------------------------------------------------------
+        const float button_h = 50.0f, button_gap = 12.0f, hint_h = hint.empty() ? 0.0f : 36.0f;
+        float total = hint_h;
+        for (const auto& it : items) total += it.height;
+        total += buttons.size() * (button_h + button_gap);
+        float widest = 0.0f;
+        for (const auto& it : items) if (it.kind == TEXT) widest = std::max(widest, text_width(it.text, it.scale));
+        float ui = std::min((H - 24.0f) / total, (W - 32.0f) / std::max(widest, 440.0f));
+        ui = std::clamp(ui, 0.35f, 1.3f);
+
+        // ---- Draw ------------------------------------------------------------------------------
+        draw_quad(0.0f, 0.0f, W, H, { 0.02f, 0.02f, 0.04f, 0.80f });
+        float y = std::max(8.0f, (H - total * ui) * 0.5f);
+        for (const auto& it : items) {
+            float h = it.height * ui;
+            if (it.kind == TEXT && !it.text.empty()) {
+                draw_text_centered(it.text, cx, y + h * 0.72f, it.color, it.scale * ui);
+            }
+            else if (it.kind == INPUT) {
+                float bw = std::min(460.0f * ui, W - 40.0f);
+                float top = y + 4.0f * ui, bottom = top + 46.0f * ui;
+                draw_quad(cx - bw / 2 - 2, top - 2, cx + bw / 2 + 2, bottom + 2, editable ? gold : dim);
+                draw_quad(cx - bw / 2, top, cx + bw / 2, bottom, { 0.08f, 0.09f, 0.12f, 1.0f });
+                bool caret = editable && std::fmod(glfwGetTime(), 1.0) < 0.5;
+                draw_text_centered(it.text + (caret ? "_" : " "), cx, top + 33.0f * ui, it.color, it.scale * ui);
+            }
+            y += h;
+        }
+
+        double mx, my;
+        glfwGetCursorPos(window, &mx, &my);
+        int ww, wh;
+        glfwGetWindowSize(window, &ww, &wh);
+        if (ww > 0 && wh > 0) { mx *= static_cast<double>(screen_width) / ww; my *= static_cast<double>(screen_height) / wh; }
+        bool mouse_moved = mx != menu_last_mx || my != menu_last_my;
+        menu_last_mx = mx;
+        menu_last_my = my;
+
+        int count = static_cast<int>(buttons.size());
+        auto enabled_at = [&](int i) { return i >= 0 && i < count && buttons[i].enabled; };
+        menu_focus = std::clamp(menu_focus, 0, std::max(0, count - 1));
+        if (!enabled_at(menu_focus)) for (int i = 0; i < count; i++) if (enabled_at(i)) { menu_focus = i; break; }
+
+        const float bw = std::min(440.0f * ui, W - 40.0f), bh = button_h * ui;
+        std::vector<glm::vec4> rects;
+        for (int i = 0; i < count; i++) {
+            glm::vec4 rc(cx - bw / 2, y, cx + bw / 2, y + bh);
+            rects.push_back(rc);
+            bool inside = mx >= rc.x && mx <= rc.z && my >= rc.y && my <= rc.w;
+            if (inside && mouse_moved && buttons[i].enabled) menu_focus = i;
+            bool focused = i == menu_focus && buttons[i].enabled;
+            glm::vec4 bg = !buttons[i].enabled ? glm::vec4(0.13f, 0.13f, 0.16f, 0.85f)
+                         : focused ? glm::vec4(0.95f, 0.78f, 0.30f, 0.97f) : glm::vec4(0.20f, 0.22f, 0.29f, 0.97f);
+            glm::vec4 fg = !buttons[i].enabled ? glm::vec4(0.45f, 0.45f, 0.50f, 1.0f)
+                         : focused ? glm::vec4(0.08f, 0.06f, 0.02f, 1.0f) : bright;
+            draw_quad(rc.x, rc.y, rc.z, rc.w, bg);
+            draw_text_centered(buttons[i].label, cx, rc.y + bh * 0.5f + 11.0f * ui, fg, ui);
+            y += bh + button_gap * ui;
+        }
+        if (!hint.empty()) draw_text_centered(hint, cx, y + 22.0f * ui, dim, 0.6f * ui);
+        draw_text("v0.3", W - 52.0f * std::max(ui, 0.6f), H - 10.0f, { 0.45f, 0.45f, 0.52f, 1.0f }, 0.55f * std::max(ui, 0.6f));
+        glEnable(GL_DEPTH_TEST);
+
+        // ---- Input, after drawing: an action may switch screens ---------------------------------
+        MenuAction chosen = MenuAction::None;
+        bool click = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+        if (click && !click_prev) {
+            for (int i = 0; i < count; i++) {
+                const glm::vec4& rc = rects[i];
+                if (buttons[i].enabled && mx >= rc.x && mx <= rc.z && my >= rc.y && my <= rc.w) chosen = buttons[i].action;
+            }
+        }
+        click_prev = click;
+        bool up = glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS;
+        bool down = glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS;
+        bool enter = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_KP_ENTER) == GLFW_PRESS;
+        if (up && !up_prev) for (int i = menu_focus - 1; i >= 0; i--) if (enabled_at(i)) { menu_focus = i; break; }
+        if (down && !down_prev) for (int i = menu_focus + 1; i < count; i++) if (enabled_at(i)) { menu_focus = i; break; }
+        if (enter && !enter_prev && enabled_at(menu_focus)) chosen = buttons[menu_focus].action;
+        up_prev = up;
+        down_prev = down;
+        enter_prev = enter;
+
+        if (chosen != MenuAction::None) menu_action(chosen);
+    }
+
+    // Other players are drawn as a small helmeted figure with a gun. It's generated here in
+    // grey and tinted per player when drawn, so it needs no image file.
+    GLuint create_player_texture() {
+        const int S = 128;
+        std::vector<unsigned char> px(static_cast<size_t>(S) * S * 4, 0);
+        // Shapes in image coordinates (y down). Each returns a grey level, or -1 for "outside".
+        auto shade_at = [](int x, int y) -> float {
+            auto in_rect = [&](int x0, int y0, int x1, int y1) { return x >= x0 && x <= x1 && y >= y0 && y <= y1; };
+            auto in_circle = [&](float cx, float cy, float r) { float dx = x - cx, dy = y - cy; return dx * dx + dy * dy <= r * r; };
+            if (in_rect(86, 58, 114, 66)) return 0.22f;          // gun barrel
+            if (in_rect(54, 22, 74, 31)) return 0.12f;           // visor
+            if (in_circle(64.0f, 30.0f, 14.0f)) return 0.92f;   // helmet
+            if (in_rect(48, 44, 80, 88)) return 0.85f;           // torso
+            if (in_rect(35, 46, 47, 82) || in_rect(81, 46, 93, 70)) return 0.72f; // arms
+            if (in_rect(50, 88, 62, 121) || in_rect(66, 88, 78, 121)) return 0.62f; // legs
+            return -1.0f;
+        };
+        std::vector<float> shade(static_cast<size_t>(S) * S);
+        for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) shade[static_cast<size_t>(y) * S + x] = shade_at(x, y);
+        for (int y = 0; y < S; y++) {
+            for (int x = 0; x < S; x++) {
+                float s = shade[static_cast<size_t>(y) * S + x];
+                bool outline = false;
+                if (s < 0.0f) { // a dark rim two pixels wide around the whole figure
+                    for (int dy = -2; dy <= 2 && !outline; dy++)
+                        for (int dx = -2; dx <= 2 && !outline; dx++) {
+                            int nx = x + dx, ny = y + dy;
+                            if (nx >= 0 && nx < S && ny >= 0 && ny < S && shade[static_cast<size_t>(ny) * S + nx] >= 0.0f) outline = true;
+                        }
+                }
+                // OpenGL's row 0 is the bottom of the image, so flip while writing.
+                unsigned char* p = &px[(static_cast<size_t>(S - 1 - y) * S + x) * 4];
+                if (s >= 0.0f) { p[0] = p[1] = p[2] = static_cast<unsigned char>(s * 255.0f); p[3] = 255; }
+                else if (outline) { p[0] = p[1] = p[2] = 20; p[3] = 255; }
+            }
+        }
+        GLuint tex;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, S, S, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glGenerateMipmap(GL_TEXTURE_2D);
+        return tex;
+    }
+
+    // Names over the other players' heads, only when you could actually see them.
+    void render_labels() {
+        if (mode == Mode::Single || !in_round || tab_view) return;
+        glViewport(0, 0, screen_width, screen_height);
+        glm::mat4 projection = glm::ortho(0.0f, static_cast<float>(screen_width), static_cast<float>(screen_height), 0.0f, -1.0f, 1.0f);
+        glm::mat4 id = glm::mat4(1.0f);
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "view"), 1, GL_FALSE, glm::value_ptr(id));
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(id));
+        glDisable(GL_DEPTH_TEST);
+
+        struct Tag { glm::vec3 pos; std::string name; glm::vec4 color; int level; };
+        std::vector<Tag> tags;
+        for (int s = 1; s <= 2; s++) {
+            if (s == my_slot) continue;
+            const RemotePlayer& r = remote[s];
+            if (!r.present || !r.has_state || !r.alive) continue;
+            float head = static_cast<float>(floor_height(r.rx, r.ry, r.level) + r.jump) + 0.72f;
+            tags.push_back({ glm::vec3(static_cast<float>(r.rx), head, static_cast<float>(r.ry)), player_name(s), player_color(s), r.level });
+        }
+        if (beast_active() && my_slot != 3) {
+            if (const Monster* m = find_monster(beast_boss_id))
+                tags.push_back({ glm::vec3(static_cast<float>(m->x), 1.0f, static_cast<float>(m->y)), "Player 3 - the Beast", player_color(3), 0 });
+        }
+        for (const auto& t : tags) {
+            if (t.level != player_level) continue;
+            if (std::hypot(t.pos.x - player_pos_x, t.pos.z - player_pos_y) > 14.0) continue;
+            if (!line_of_sight(t.level, player_pos_x, player_pos_y, t.pos.x, t.pos.z)) continue;
+            glm::vec4 clip = last_proj * last_view * glm::vec4(t.pos, 1.0f);
+            if (clip.w < 0.05f) continue; // behind the camera
+            glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            if (std::fabs(ndc.x) > 1.05f || std::fabs(ndc.y) > 1.05f) continue;
+            float sx = (ndc.x * 0.5f + 0.5f) * screen_width;
+            float sy = (1.0f - (ndc.y * 0.5f + 0.5f)) * screen_height;
+            draw_text_centered(t.name, sx, sy, t.color, 0.6f);
+        }
+        glEnable(GL_DEPTH_TEST);
+    }
+
+    // Big centre-screen messages: winning, dying, locked exits, the end of a round.
+    void render_center_message(int bosses) {
+        glDisable(GL_DEPTH_TEST);
+        float cx = screen_width * 0.5f, cy = screen_height * 0.5f;
+        if (mode == Mode::Single) {
+            if (showing_win) draw_text_centered("You Won!", cx, cy, { 1, 1, 0, 1 });
+            else if (showing_die) draw_text_centered("You Died!", cx, cy, { 1, 0, 0, 1 });
+        }
+        else if (in_round && round_over) {
+            std::string who = round_winner == my_slot ? "You escaped the maze!" : capitalised(player_name(round_winner)) + " escaped the maze!";
+            draw_text_centered(who, cx, cy, round_winner == my_slot ? glm::vec4(1, 1, 0, 1) : player_color(round_winner));
+            int secs = std::max(0, static_cast<int>(std::ceil(round_over_until - glfwGetTime())));
+            draw_text_centered("Next maze in " + std::to_string(secs) + "...", cx, cy + 40.0f, { 0.85f, 0.85f, 0.9f, 1.0f }, 0.8f);
+        }
+        else if (showing_die) {
+            draw_text_centered(killed_by == 0 ? std::string("You were killed by a monster")
+                                              : "You were killed by " + player_name(killed_by), cx, cy, { 1, 0.2f, 0.2f, 1 });
+        }
+        else if (spectating) {
+            draw_text_centered("Your beast was defeated - spectating until the next maze", cx, cy, player_color(3), 0.8f);
+        }
+        // Only in a real game: in a lobby the paused maze behind the menu isn't yours to exit.
+        bool playing = mode == Mode::Single || in_round;
+        if (playing && !showing_die && !showing_win && !(in_round && round_over) && !is_beast()) {
+            // Standing on your exit with bosses still alive: tell the player it's locked.
+            auto e = exit_cell(my_slot);
+            bool at_exit = player_level == 0 && static_cast<int>(player_pos_x) == e.first && static_cast<int>(player_pos_y) == e.second;
+            if (at_exit && bosses > 0) {
+                std::string msg = "Exit locked: " + std::to_string(bosses) + (bosses == 1 ? " boss remaining" : " bosses remaining");
+                draw_text_centered(msg, cx, cy, { 1.0f, 0.3f, 0.3f, 1.0f });
+            }
+        }
+        glEnable(GL_DEPTH_TEST);
+    }
+
     void run() {
         last_time = glfwGetTime();
+        const double launch_time = last_time;
         double last_mouse_x = screen_width / 2.0;
         double last_mouse_y = screen_height / 2.0;
         while (!glfwWindowShouldClose(window)) {
             double current_time = glfwGetTime();
-            double delta = current_time - last_time;
+            // Clamped, so a stall (dragging the window, a debugger pause) can't fling things
+            // through walls in one giant step.
+            double delta = std::min(current_time - last_time, 0.25);
             last_time = current_time;
+            if (opts.quit_after > 0.0 && current_time - launch_time > opts.quit_after)
+                glfwSetWindowShouldClose(window, true);
 
-            process_input(delta, last_mouse_x, last_mouse_y);
+            handle_escape();
+            pump_network();
+            if (mode == Mode::Host && !in_round && opts.autostart > 0 && (lobby_mask & (1 << 2))
+                && player_count() >= opts.autostart)
+                host_start_round();
 
-            update_projectiles(delta);
-            update_monster_projectiles(delta);
-            update_monsters(delta);
-            update_audio_cues();
+            // Singleplayer pauses behind the menu. A multiplayer game can't pause for one player,
+            // so it carries on; you just stand still while your menu is open.
+            bool world_running = mode == Mode::Single ? screen == Screen::None : in_round;
 
-            // Monsters and health packs sit on the maze level; standing under them doesn't count.
-            if (damage_cooldown > 0) damage_cooldown--;
-            else if (player_level == 0) {
-                for (auto& m : monsters) {
-                    double dist = std::hypot(m.x - player_pos_x, m.y - player_pos_y);
-                    if (dist < 0.8) {
-                        player_hp -= 1;
-                        damage_cooldown = 30;
-                        break;
+            if (world_running) {
+                process_input(delta, last_mouse_x, last_mouse_y);
+                if (opts.test_fire && mode != Mode::Single) {
+                    test_fire_timer -= delta;
+                    if (test_fire_timer <= 0.0) {
+                        test_fire_timer = 2.0;
+                        if (is_beast()) beast_shoot();
+                        else if (!showing_die) shoot();
                     }
                 }
-            }
 
-            for (auto it = health_packs.begin(); it != health_packs.end(); ) {
-                if (it->level == player_level && std::hypot(it->x - player_pos_x, it->y - player_pos_y) < MEDPACK_PICKUP_RADIUS) {
-                    player_hp = max_hp;
-                    it = health_packs.erase(it);
+                update_projectiles(delta);
+                update_monster_projectiles(delta);
+                if (mode == Mode::Client) smooth_monsters(delta); // the host runs the monsters
+                else update_monsters(delta);
+                smooth_remote_players(delta);
+                update_audio_cues();
+
+                // Monsters and health packs sit on the maze level; standing under them doesn't count.
+                if (damage_cooldown > 0) damage_cooldown--;
+                else if (player_level == 0 && !is_beast()) {
+                    for (auto& m : monsters) {
+                        double dist = std::hypot(m.x - player_pos_x, m.y - player_pos_y);
+                        if (dist < 0.8) {
+                            take_damage(1, (beast_active() && m.id == beast_boss_id) ? 3 : 0);
+                            damage_cooldown = 30;
+                            break;
+                        }
+                    }
                 }
-                else {
-                    ++it;
+
+                if (!is_beast()) {
+                    for (auto it = health_packs.begin(); it != health_packs.end(); ) {
+                        if (it->level == player_level && std::hypot(it->x - player_pos_x, it->y - player_pos_y) < MEDPACK_PICKUP_RADIUS) {
+                            player_hp = max_hp;
+                            int id = it->id;
+                            it = health_packs.erase(it);
+                            // The host decides who really got it; a tie just heals you both.
+                            net::Writer w;
+                            if (mode == Mode::Client) {
+                                w.put<uint8_t>(MSG_PICKUP).put<uint8_t>(round_id).put<int32_t>(id);
+                                net.send_to_host(w.buf, true);
+                            }
+                            else if (mode == Mode::Host) {
+                                w.put<uint8_t>(MSG_PACK_GONE).put<uint8_t>(round_id).put<int32_t>(id);
+                                net.broadcast(w.buf, true);
+                            }
+                        }
+                        else {
+                            ++it;
+                        }
+                    }
                 }
+
+                int bosses = boss_count();
+                auto goal = exit_cell(my_slot);
+                bool at_exit = !is_beast() && player_level == 0
+                    && static_cast<int>(player_pos_x) == goal.first && static_cast<int>(player_pos_y) == goal.second;
+                if (mode == Mode::Single) {
+                    if (!showing_win && at_exit && bosses == 0) {
+                        showing_win = true;
+                        win_timer = current_time + 1.0;
+                    }
+                }
+                else if (!round_over && !showing_die) {
+                    if (at_exit && bosses == 0) {
+                        if (mode == Mode::Host) end_round(my_slot);
+                        else if (!exit_reported) {
+                            net::Writer w;
+                            w.put<uint8_t>(MSG_REACHED_EXIT).put<uint8_t>(round_id).put<uint8_t>(static_cast<uint8_t>(my_slot));
+                            net.send_to_host(w.buf, true);
+                            exit_reported = true;
+                        }
+                    }
+                    if (!at_exit) exit_reported = false; // try again if the host said "not yet"
+                }
+
+                if (!showing_die && player_hp <= 0 && !is_beast()) {
+                    showing_die = true;
+                    die_timer = current_time + 1.5;
+                    killed_by = last_damage_by;
+                    if (mode != Mode::Single) {
+                        net::Writer w;
+                        w.put<uint8_t>(MSG_DEATH).put<uint8_t>(round_id).put<uint8_t>(static_cast<uint8_t>(my_slot))
+                         .put<uint8_t>(static_cast<uint8_t>(killed_by));
+                        send_msg(w.buf, true);
+                        add_feed(death_text(my_slot, killed_by));
+                    }
+                }
+
+                if (showing_win && current_time > win_timer) {
+                    regenerate_maze();
+                }
+                else if (showing_die && current_time > die_timer) {
+                    if (mode == Mode::Single) respawn_player(); // same maze, back to the start
+                    else { place_player_at_spawn(true); showing_die = false; } // your own start
+                }
+
+                if (mode != Mode::Single) send_periodic(delta);
+            }
+            else if (mode == Mode::Single) {
+                stop_boss_sound(); // paused behind the menu
             }
 
-            int boss_count = 0;
-            for (const auto& m : monsters) if (m.type == 2) boss_count++;
-            if (!showing_win && player_level == 0 && static_cast<int>(player_pos_x) == end.first && static_cast<int>(player_pos_y) == end.second && boss_count == 0) {
-                showing_win = true;
-                win_timer = current_time + 1.0;
-            }
-
-            if (!showing_die && player_hp <= 0) {
-                showing_die = true;
-                die_timer = current_time + 1.5;
-            }
-
-            if (showing_win && current_time > win_timer) {
-                regenerate_maze();
-            }
-            else if (showing_die && current_time > die_timer) {
-                respawn_player(); // same maze, back to the start
-            }
+            if (mode == Mode::Host && in_round && round_over && current_time > round_over_until)
+                host_start_round();
+            feed.erase(std::remove_if(feed.begin(), feed.end(),
+                       [current_time](const std::pair<std::string, double>& f) { return f.second < current_time; }), feed.end());
 
             glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -2114,63 +3644,64 @@ public:
             }
             else {
                 render_3d();
-                render_viewmodel();
+                if (!is_beast()) render_viewmodel(); // the Beast is a boss, not someone holding a gun
                 render_minimap();
             }
 
-            render_hud(boss_count);
+            int hud_bosses = boss_count();
+            render_hud(hud_bosses);
+            render_labels();
+            render_center_message(hud_bosses);
+            if (screen != Screen::None) render_menu();
 
-            if (showing_win) {
-                glDisable(GL_DEPTH_TEST);
-                draw_text("You Won!", static_cast<float>(screen_width / 2 - 100), static_cast<float>(screen_height / 2), { 1,1,0,1 });
-                glEnable(GL_DEPTH_TEST);
-            }
-            else if (showing_die) {
-                glDisable(GL_DEPTH_TEST);
-                draw_text("You Died!", static_cast<float>(screen_width / 2 - 100), static_cast<float>(screen_height / 2), { 1,0,0,1 });
-                glEnable(GL_DEPTH_TEST);
-            }
-            else {
-                // Standing on the exit with bosses still alive: tell the player it's locked.
-                bool at_exit = player_level == 0 && static_cast<int>(player_pos_x) == end.first && static_cast<int>(player_pos_y) == end.second;
-                if (at_exit && boss_count > 0) {
-                    glDisable(GL_DEPTH_TEST);
-                    std::string msg = "Exit locked: " + std::to_string(boss_count)
-                        + (boss_count == 1 ? " boss remaining" : " bosses remaining");
-                    draw_text(msg, static_cast<float>(screen_width / 2 - 220), static_cast<float>(screen_height / 2), { 1.0f, 0.3f, 0.3f, 1.0f });
-                    glEnable(GL_DEPTH_TEST);
-                }
-            }
+            typed.clear();
+            backspaces = 0;
+            if (net.active()) net.flush();
 
+            if (!opts.screenshot.empty() && glfwWindowShouldClose(window)) save_screenshot(opts.screenshot);
             glfwSwapBuffers(window);
             glfwPollEvents();
         }
     }
 
     void process_input(double delta, double& last_mouse_x, double& last_mouse_y) {
-        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) glfwSetWindowShouldClose(window, true);
+        // Esc is handled in the main loop: it opens the menu. With a menu open (only possible
+        // here during a multiplayer round) the player just stands still; physics carries on.
+        bool controls = screen == Screen::None;
+        bool can_move = controls && !spectating;
 
-        if (glfwGetKey(window, GLFW_KEY_F8) == GLFW_PRESS) regenerate_maze();
+        // F8 makes a new maze: in singleplayer straight away; in multiplayer only the host can,
+        // and it starts a new round for everyone. One maze per press, not one per frame held.
+        bool f8_down = controls && glfwGetKey(window, GLFW_KEY_F8) == GLFW_PRESS;
+        if (f8_down && !f8_pressed) {
+            if (mode == Mode::Single) regenerate_maze();
+            else if (mode == Mode::Host) host_start_round();
+        }
+        f8_pressed = f8_down;
 
         // Tab toggles the map view (press to switch, no longer hold-to-view).
-        bool tab_down = glfwGetKey(window, GLFW_KEY_TAB) == GLFW_PRESS;
+        bool tab_down = controls && glfwGetKey(window, GLFW_KEY_TAB) == GLFW_PRESS;
         if (tab_down && !tab_pressed) tab_view = !tab_view;
         tab_pressed = tab_down;
 
         // F5 toggles developer mode; F6 teleports through boss rooms while it is enabled.
-        bool f5_down = glfwGetKey(window, GLFW_KEY_F5) == GLFW_PRESS;
+        // Singleplayer only - teleporting around a shared maze would just be cheating.
+        bool dev_keys = controls && mode == Mode::Single;
+        bool f5_down = dev_keys && glfwGetKey(window, GLFW_KEY_F5) == GLFW_PRESS;
         if (f5_down && !f5_pressed) dev_mode = !dev_mode;
         f5_pressed = f5_down;
 
-        bool f6_down = glfwGetKey(window, GLFW_KEY_F6) == GLFW_PRESS;
+        bool f6_down = dev_keys && glfwGetKey(window, GLFW_KEY_F6) == GLFW_PRESS;
         if (f6_down && !f6_pressed && dev_mode) dev_teleport_to_boss_room();
         f6_pressed = f6_down;
 
-        bool f7_down = glfwGetKey(window, GLFW_KEY_F7) == GLFW_PRESS;
+        bool f7_down = dev_keys && glfwGetKey(window, GLFW_KEY_F7) == GLFW_PRESS;
         if (f7_down && !f7_pressed && dev_mode) dev_teleport_near_exit();
         f7_pressed = f7_down;
 
         double move_speed = 0.04182 * 60.0 * delta; // 15% slower again (was 0.0492)
+        if (is_beast()) move_speed *= BEAST_SPEED;
+        if (!can_move) move_speed = 0.0;
 
         // Facing-relative WASD in both 3D and Tab (matches look direction / green arrow)
         double new_x = player_pos_x;
@@ -2206,12 +3737,16 @@ public:
         // Spacebar hops. Height is relative to the floor under you, so it behaves the same on
         // the stairs and the lower level. Holding the key hops again each time you land.
         bool grounded = jump_height <= 0.0 && jump_velocity <= 0.0;
-        if (grounded && glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) jump_velocity = JUMP_SPEED;
+        // Bosses don't hop, so neither does the Beast.
+        if (grounded && can_move && !is_beast() && glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) jump_velocity = JUMP_SPEED;
         if (!grounded || jump_velocity > 0.0) {
             jump_velocity -= GRAVITY * delta;
             jump_height += jump_velocity * delta;
             if (jump_height <= 0.0) { jump_height = 0.0; jump_velocity = 0.0; }
         }
+
+        recoil = std::max(0.0, recoil - delta);
+        if (!controls) return; // menu open: no looking around or shooting
 
         double xpos, ypos;
         glfwGetCursorPos(window, &xpos, &ypos);
@@ -2240,11 +3775,13 @@ public:
 
         // One shot per click: fire on the press edge only, so holding the button does nothing
         // until you release and click again. Rate of fire is now whatever your finger manages.
-        recoil = std::max(0.0, recoil - delta);
         bool fire_down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-        if (fire_down && !fire_pressed) {
-            shoot();
-            recoil = recoil_time;
+        if (fire_down && !fire_pressed && can_move) {
+            if (is_beast()) beast_shoot();
+            else {
+                shoot();
+                recoil = recoil_time;
+            }
         }
         fire_pressed = fire_down;
     }
@@ -2261,6 +3798,8 @@ public:
         glm::vec3 camera_up(0.0f, 1.0f, 0.0f);
         glm::mat4 view = glm::lookAt(camera_pos, camera_pos + camera_front, camera_up);
         glUniformMatrix4fv(glGetUniformLocation(shader_program, "view"), 1, GL_FALSE, glm::value_ptr(view));
+        last_proj = projection; // kept for placing name labels over other players
+        last_view = view;
 
         glm::mat4 model = glm::mat4(1.0f);
         glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(model));
@@ -2314,10 +3853,12 @@ public:
         glBindVertexArray(lower_boundary_vao);
         glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(lower_boundary_index_count), GL_UNSIGNED_INT, nullptr);
 
-        // Exit marker: a red square on the floor of the exit cell (model is still identity).
-        {
-            float ex = static_cast<float>(end.first);
-            float ez = static_cast<float>(end.second);
+        // Exit marker: a red square on the floor of your exit cell (model is still identity).
+        // Player 2's exit is Player 1's start; the Beast has none.
+        if (!is_beast()) {
+            auto goal = exit_cell(my_slot);
+            float ex = static_cast<float>(goal.first);
+            float ez = static_cast<float>(goal.second);
             float y = 0.02f; // just above the floor to avoid z-fighting
             float exit_verts[] = {
                 ex,        y, ez,        0.0f, 0.0f,
@@ -2335,6 +3876,7 @@ public:
 
         std::vector<Sprite> sprites;
         for (const auto& m : monsters) {
+            if (is_beast() && m.id == beast_boss_id) continue; // you are this one
             // Untinted (white) normally; flash red only right after a successful hit.
             glm::vec4 tint = (m.hit_flash > 0) ? glm::vec4(1.0f, 0.25f, 0.25f, 1.0f) : glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
             float centre_y = 0.5f - monster_sink(m.type); // feet on the floor, not the image edge
@@ -2347,6 +3889,16 @@ public:
             float floor_y = h.level == 0 ? 0.0f : static_cast<float>(lower_floor_y);
             float centre_y = floor_y + MEDPACK_HALF_SIZE * (1.0f - 2.0f * medpack_bottom_margin) + 0.003f;
             sprites.emplace_back(Sprite{ glm::vec3(static_cast<float>(h.x), centre_y, static_cast<float>(h.y)), MEDPACK_HALF_SIZE, medpack_tex, {1,1,1,1}, true, 0.0 });
+        }
+        // The other explorer, in their colour, flashing red for a moment when hurt.
+        for (int s = 1; s <= 2 && mode != Mode::Single; s++) {
+            if (s == my_slot) continue;
+            const RemotePlayer& r = remote[s];
+            if (!r.present || !r.has_state || !r.alive) continue;
+            float feet = static_cast<float>(floor_height(r.rx, r.ry, r.level) + r.jump);
+            glm::vec4 tint = glfwGetTime() < r.flash_until ? glm::vec4(1.0f, 0.25f, 0.25f, 1.0f) : player_color(s);
+            sprites.emplace_back(Sprite{ glm::vec3(static_cast<float>(r.rx), feet + PLAYER_SPRITE_HALF - PLAYER_SPRITE_SINK + 0.003f,
+                                                   static_cast<float>(r.ry)), PLAYER_SPRITE_HALF, player_tex, tint, true, 0.0 });
         }
         for (const auto& p : projectiles) {
             glm::vec3 pp(static_cast<float>(p.x), static_cast<float>(p.z), static_cast<float>(p.y));
@@ -2534,6 +4086,14 @@ public:
             draw_quad(static_cast<float>(h.x - 0.17), static_cast<float>(h.y - 0.17), static_cast<float>(h.x + 0.17), static_cast<float>(h.y + 0.17), { 0.68f, 0.85f, 0.9f, 1.0f });
         }
 
+        // The other explorer, if they're on the level being viewed.
+        for (int s = 1; s <= 2 && mode != Mode::Single; s++) {
+            if (s == my_slot) continue;
+            const RemotePlayer& r = remote[s];
+            if (!r.present || !r.has_state || !r.alive || r.level != player_level) continue;
+            draw_circle(static_cast<float>(r.rx), static_cast<float>(r.ry), 0.34f, player_color(s));
+        }
+
         // Everything below lives on the maze level only.
         if (player_level != 0) {
             draw_circle(static_cast<float>(player_pos_x), static_cast<float>(player_pos_y), 0.4f, { 0.0f, 1.0f, 0.0f, 1.0f });
@@ -2543,10 +4103,14 @@ public:
             return;
         }
 
-        draw_quad(static_cast<float>(end.first), static_cast<float>(end.second), static_cast<float>(end.first + 1), static_cast<float>(end.second + 1), { 1.0f, 0.24f, 0.24f, 1.0f });
+        if (!is_beast()) {
+            auto goal = exit_cell(my_slot);
+            draw_quad(static_cast<float>(goal.first), static_cast<float>(goal.second), static_cast<float>(goal.first + 1), static_cast<float>(goal.second + 1), { 1.0f, 0.24f, 0.24f, 1.0f });
+        }
 
         for (const auto& m : monsters) {
             glm::vec4 color = m.type == 1 ? glm::vec4(0.14f, 0.22f, 0.77f, 1.0f) : glm::vec4(0.71f, 0.12f, 0.71f, 1.0f);
+            if (beast_active() && m.id == beast_boss_id) color = player_color(3); // the Beast stands out
             draw_circle(static_cast<float>(m.x), static_cast<float>(m.y), 0.198f, color); // 40% smaller
             float hp_frac = std::clamp(static_cast<float>(m.hp) / (m.type == 2 ? 440.0f : 300.0f), 0.0f, 1.0f);
             draw_quad(static_cast<float>(m.x - 0.33), static_cast<float>(m.y - 0.4), static_cast<float>(m.x + 0.33), static_cast<float>(m.y - 0.32), { 1.0f, 0.0f, 0.0f, 1.0f });
@@ -2584,17 +4148,45 @@ public:
         float bar_h = 20.0f;
         float bar_x = 10.0f;
         float bar_y = static_cast<float>(screen_height) - 40.0f;
+        // The Beast's health is its boss's.
+        int hp_now = player_hp, hp_max = max_hp;
+        std::string hp_label = "HP: ";
+        if (is_beast()) {
+            const Monster* m = find_monster(beast_boss_id);
+            hp_now = m ? m->hp : 0;
+            hp_max = BEAST_MAX_HP;
+            hp_label = "Beast HP: ";
+        }
         draw_quad(bar_x, bar_y, bar_x + bar_w, bar_y + bar_h, { 1.0f, 0.0f, 0.0f, 1.0f });
-        float green_w = bar_w * (player_hp / static_cast<float>(max_hp));
+        float green_w = bar_w * std::clamp(hp_now / static_cast<float>(hp_max), 0.0f, 1.0f);
         draw_quad(bar_x, bar_y, bar_x + green_w, bar_y + bar_h, { 0.0f, 1.0f, 0.0f, 1.0f });
 
         // Draw text with white color
-        draw_text("HP: " + std::to_string(player_hp) + "/" + std::to_string(max_hp), bar_x + bar_w + 10, bar_y + 5, { 1.0f, 1.0f, 1.0f, 1.0f });
+        draw_text(hp_label + std::to_string(hp_now) + "/" + std::to_string(hp_max), bar_x + bar_w + 10, bar_y + 5, { 1.0f, 1.0f, 1.0f, 1.0f });
         draw_text("Bosses: " + std::to_string(boss_count), bar_x, bar_y - 30, { 1.0f, 1.0f, 1.0f, 1.0f });
         if (player_level != 0)
             draw_text("Lower Level", bar_x, bar_y - 60, { 0.55f, 0.75f, 1.0f, 1.0f });
 
-        if (dev_mode) draw_text("DEV MODE - F6: boss room  F7: near exit", 10.0f, 30.0f, { 0.75f, 0.75f, 0.75f, 1.0f });
+        if (dev_mode && mode == Mode::Single) draw_text("DEV MODE - F6: boss room  F7: near exit", 10.0f, 30.0f, { 0.75f, 0.75f, 0.75f, 1.0f });
+
+        // Multiplayer: who you are and what you're after, centred along the top, with the kill
+        // feed down the right. Both stay clear of the minimap in the top-left corner.
+        if (mode != Mode::Single && in_round) {
+            float w = static_cast<float>(screen_width);
+            float minimap_right = 16.0f + std::max(64.0f, std::min(w, static_cast<float>(screen_height)) / 5.0f);
+            std::string goal = my_slot == 1 ? "Player 1 (host): kill the bosses, then reach the exit"
+                             : my_slot == 2 ? "Player 2: kill the bosses, then reach Player 1's starting point"
+                             : "Player 3 - the Beast: hunt the explorers down";
+            float room = w - 2.0f * (minimap_right + 12.0f);
+            float s = std::clamp(room / std::max(1.0f, text_width(goal, 1.0f)), 0.4f, 0.75f);
+            draw_text_centered(goal, w * 0.5f, 34.0f, player_color(my_slot), s);
+            float y = 64.0f;
+            for (const auto& f : feed) {
+                float fs = std::clamp((w * 0.45f) / std::max(1.0f, text_width(f.first, 1.0f)), 0.4f, 0.62f);
+                draw_text(f.first, w - text_width(f.first, fs) - 14.0f, y, { 0.92f, 0.92f, 0.95f, 1.0f }, fs);
+                y += 26.0f;
+            }
+        }
 
         glEnable(GL_DEPTH_TEST);
     }
@@ -2641,8 +4233,7 @@ public:
         glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(model));
     }
 
-    void draw_text(const std::string& text, float x, float y, glm::vec4 color) {
-        float scale = 1.0f;
+    void draw_text(const std::string& text, float x, float y, glm::vec4 color, float scale = 1.0f) {
         GLuint vao, vbo;
         glGenVertexArrays(1, &vao);
         glBindVertexArray(vao);
@@ -2689,9 +4280,36 @@ public:
     }
 };
 
-int main() {
+static LaunchOptions parse_args(int argc, char** argv) {
+    LaunchOptions o;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto value = [&](const std::string& key) -> std::string {
+            // Accepts both "--key=value" and "--key value".
+            if (a.rfind(key + "=", 0) == 0) return a.substr(key.size() + 1);
+            if (a == key && i + 1 < argc) return argv[++i];
+            return "";
+        };
+        if (a == "--windowed") o.windowed = true;
+        else if (a == "--windowed=left") { o.windowed = true; o.window_side = 1; }
+        else if (a == "--windowed=right") { o.windowed = true; o.window_side = 2; }
+        else if (a == "--host") o.host = true;
+        else if (a.rfind("--join", 0) == 0) o.join = value("--join");
+        else if (a.rfind("--autostart", 0) == 0) o.autostart = std::atoi(value("--autostart").c_str());
+        else if (a.rfind("--quit-after", 0) == 0) o.quit_after = std::atof(value("--quit-after").c_str());
+        else if (a == "--test") o.test = true;
+        else if (a == "--test-fire") o.test_fire = true;
+        else if (a == "--test-spawn-near") o.test_spawn_near = true;
+        else if (a == "--open-menu") o.open_menu = true;
+        else if (a.rfind("--screenshot", 0) == 0) o.screenshot = value("--screenshot");
+        else std::cerr << "Unknown option: " << a << std::endl;
+    }
+    return o;
+}
+
+int main(int argc, char** argv) {
     try {
-        MazeGame game;
+        MazeGame game(parse_args(argc, argv));
     }
     catch (const std::exception& e) {
         std::cerr << "Error launching game: " << e.what() << std::endl;

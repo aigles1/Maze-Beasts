@@ -15,8 +15,30 @@ Defeat the bosses and find the exit of the maze.
 | **Left click** | Shoot |
 | **Spacebar** | Jump |
 | **Tab** | Show the entire maze |
-| **F8** | Generate a new maze |
-| **Esc** | Close the game |
+| **F8** | Generate a new maze (in multiplayer, host only) |
+| **Esc** | Open the menu (choose **Exit** there to close the game) |
+
+## Multiplayer
+
+Press **Esc** for the menu: **Singleplayer**, **Multiplayer - Join**, **Multiplayer - Host** and **Exit**.
+
+- **Hosting:** choose *Multiplayer - Host*. The lobby shows your IP address and a maze seed, and says *Waiting for players*. Once a second player joins it shows *2/3 players joined* and you can click **Start the game**.
+- **Joining:** choose *Multiplayer - Join*, type the host's IP address and press **Connect**. The game uses **UDP port 29180**.
+
+**Two or three players:**
+
+- **Player 1** (the host) starts where singleplayer does, and has the same goal: kill the bosses, then reach the exit.
+- **Player 2** starts at the exit, and must escape through Player 1's starting point.
+- Both players hunt the same bosses, so every boss killed helps both of you toward your own exit.
+- The two players can also shoot each other. A killed player respawns at their own starting point.
+- **Player 3** is optional, and controls one of the bosses, *the Beast*. If that boss dies, Player 3 takes over another surviving boss.
+
+**Playing across computers:**
+
+- The host may see a Windows Firewall prompt the first time they host. Allow it on private networks for LAN play.
+- Over the internet, the host must forward UDP port 29180 on their router.
+
+**Trying it on one PC:** run `Test multiplayer on this PC.bat` from the release folder. It opens two windowed copies side by side, and you connect one to the other with `127.0.0.1`. You can also start copies yourself with `MazeBeasts.exe --windowed=left` and `--windowed=right`.
 
 ## Why C++
 
@@ -57,3 +79,4 @@ It includes third-party components under their own licenses:
 - [glad](https://github.com/Dav1dde/glad): generated OpenGL loader
 - [miniaudio](https://miniaud.io/): public domain / MIT No Attribution
 - [stb_image and stb_truetype](https://github.com/nothings/stb): public domain / MIT
+- [ENet](https://github.com/lsalzman/enet): MIT License (see `MazeBeasts/enet/LICENSE`)
