@@ -6,6 +6,7 @@
 // also builds on Linux for the dedicated server.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -72,6 +73,13 @@ public:
         std::memcpy(buf.data() + n, &v, sizeof(T));
         return *this;
     }
+    // A short string: one length byte, then up to 255 bytes of it.
+    Writer& put_text(const std::string& s) {
+        size_t n = s.size() < 255 ? s.size() : 255;
+        put<uint8_t>(static_cast<uint8_t>(n));
+        buf.insert(buf.end(), s.begin(), s.begin() + static_cast<std::ptrdiff_t>(n));
+        return *this;
+    }
     std::vector<uint8_t> buf;
 };
 
@@ -86,6 +94,14 @@ public:
         else ok = false;
         pos += sizeof(T);
         return v;
+    }
+    // The counterpart of Writer::put_text.
+    std::string get_text() {
+        size_t n = get<uint8_t>();
+        if (!ok || pos + n > data.size()) { ok = false; return std::string(); }
+        std::string s(data.begin() + static_cast<std::ptrdiff_t>(pos), data.begin() + static_cast<std::ptrdiff_t>(pos + n));
+        pos += n;
+        return s;
     }
     bool ok = true;
 private:

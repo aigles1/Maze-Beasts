@@ -14,7 +14,9 @@
 // anything still in flight from a previous maze is recognised and ignored.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <string>
 
 enum Msg : uint8_t {
     MSG_HELLO = 1,     // C->S  u8 protocol version
@@ -35,11 +37,14 @@ enum Msg : uint8_t {
     MSG_BEAST_BOSS,    // S->C  u8 round, i32 boss id the Beast now controls (-1 = none left)
     MSG_REQUEST_START, // C->S  dedicated server only: Player 1 asks for the first maze, or a new one
     MSG_TO_LOBBY,      // S->C  dedicated server only: no explorers left, so the round is abandoned
+    MSG_CHAT,          // C->S  text (u8 length + bytes); S->C  u8 sender's slot, then the text.
+                       //       Not tied to a round: it works in the lobby and between mazes too.
 };
 
 // 2 (v0.4): dedicated servers, and a maze generator that no longer depends on the compiler's
 // standard library - so a v0.3 copy would build a different maze from the same seed.
-constexpr uint8_t PROTOCOL_VERSION = 2;
+// 3 (v0.41): chat. An older server or host would silently drop it, so they don't mix.
+constexpr uint8_t PROTOCOL_VERSION = 3;
 
 enum RejectReason : uint8_t { REJECT_IN_PROGRESS = 1, REJECT_VERSION = 2, REJECT_FULL = 3 };
 
@@ -51,3 +56,28 @@ enum WelcomeFlags : uint8_t {
 constexpr double STATE_INTERVAL     = 1.0 / 30.0; // each player's own position, 30 times a second
 constexpr double MONSTER_INTERVAL   = 1.0 / 20.0; // the authority's monster snapshot
 constexpr double ROUND_OVER_SECONDS = 5.0;        // winner banner before the next maze
+
+constexpr size_t CHAT_MAX_CHARS = 200;
+
+// What a chat message may contain: the game's font has printable ASCII only, so anything else
+// becomes '?' (one per character), line breaks and tabs become spaces, and it is cut at
+// CHAT_MAX_CHARS. Senders, the server and receivers all apply it, so nobody has to trust
+// what arrives over the network.
+inline std::string clean_chat_text(const std::string& in, size_t max_chars = CHAT_MAX_CHARS) {
+    std::string out;
+    for (size_t i = 0; i < in.size() && out.size() < max_chars; i++) {
+        unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c == '\n' || c == '\r' || c == '\t') {
+            if (!out.empty() && out.back() != ' ') out.push_back(' ');
+        }
+        else if (c >= 32 && c < 127) out.push_back(static_cast<char>(c));
+        else if (c >= 0xC0) out.push_back('?'); // the first byte of a UTF-8 character; the rest are skipped
+    }
+    return out;
+}
+
+inline std::string trim_spaces(const std::string& s) {
+    size_t a = s.find_first_not_of(' ');
+    if (a == std::string::npos) return "";
+    return s.substr(a, s.find_last_not_of(' ') - a + 1);
+}

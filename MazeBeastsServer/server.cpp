@@ -39,7 +39,7 @@
 
 namespace {
 
-const char* const VERSION = "0.4";
+const char* const VERSION = "0.41";
 constexpr double TICK = 1.0 / 60.0;   // monster AI rate: what a hosting player's game runs at 60 fps
 constexpr int MAX_PLAYERS = 3;
 constexpr int SPARE_CONNECTIONS = 2;  // so a 4th player is told "full" rather than timing out
@@ -351,6 +351,18 @@ private:
         if (type == MSG_HELLO) { on_hello(peer, r); return; }
         int s = slot_of(peer);
         if (s < 0) return; // hasn't said hello yet
+
+        if (type == MSG_CHAT) {
+            // Passed on to everyone else, labelled with who said it. Chat isn't tied to a
+            // round, so it works in the lobby too.
+            std::string text = trim_spaces(clean_chat_text(r.get_text()));
+            if (!r.ok || text.empty()) return;
+            net::Writer w;
+            w.put<uint8_t>(MSG_CHAT).put<uint8_t>(static_cast<uint8_t>(s)).put_text(text);
+            net.broadcast(w.buf, true, peer);
+            log_line("[chat] " + name(s) + ": " + text);
+            return;
+        }
 
         if (type == MSG_REQUEST_START) {
             // Player 1's Start button in the lobby, or F8 for a fresh maze during a game.

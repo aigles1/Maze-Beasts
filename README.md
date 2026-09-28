@@ -16,9 +16,20 @@ Defeat the bosses and find the exit of the maze.
 | **Spacebar** | Jump |
 | **Tab** | Show the entire maze |
 | **F8** | Generate a new maze (in multiplayer, host only) |
-| **Esc** | Open the menu (choose **Exit** there to close the game) |
+| **Enter** | Chat: type a message (up to 200 characters), then **Enter** again to send it |
+| **Y** | Open or close the chat log |
+| **Ctrl+C / Ctrl+V** | Copy and paste, in chat and in the Join screen's address box |
+| **Esc** | Close the chat line or chat log; otherwise open the menu (choose **Exit** there to close the game) |
 
 While spectating in multiplayer, **W A S D** and the mouse fly you around, **Spacebar** goes up and **Ctrl** (or **C**) goes down.
+
+## Chat
+
+Press **Enter**, type, and press **Enter** again to send (**Esc** cancels). Messages appear along the bottom centre of everyone's screen for 15 seconds, with up to 8 showing at once: a new one pushes the oldest off the top.
+
+**Y** opens the chat log, a small window with everything said since the game started. **Up** and **Down** pick a message and **Ctrl+C** copies it; the mouse wheel, **Page Up**, **Page Down**, **Home** and **End** scroll. The log is kept in memory only, so it's gone when you close the game.
+
+**Ctrl+V** pastes into the chat line, and into the Join screen's address box (replacing what's there). **Ctrl+C** copies what you've typed, or on the Host screen copies your IP address to send to the others. The game's font shows plain English letters, numbers and punctuation; other characters appear as `?`.
 
 ## Sound
 
