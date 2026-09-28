@@ -1,6 +1,6 @@
 # MazeBeasts dedicated server
 
-A headless server for MazeBeasts multiplayer (v0.4 and later). Two or three players connect to it directly by IP address and port. It runs the maze's monsters and bosses, decides who gets each medpack and who escaped first, starts the rounds, and relays every player's moves and shots to the others. It uses ENet (reliable UDP) on **UDP port 29180**.
+A headless server for MazeBeasts multiplayer (v0.41: games and server must be the same version). Two or three players connect to it directly by IP address and port. It runs the maze's monsters and bosses, decides who gets each medpack and who escaped first, starts the rounds, and relays every player's moves and shots to the others. It uses ENet (reliable UDP) on **UDP port 29180**.
 
 It builds the same maze as the players from a shared seed. The maze generator doesn't depend on the compiler's standard library, so a Linux server built with GCC agrees exactly with the Windows game.
 
@@ -11,6 +11,7 @@ It builds the same maze as the players from a shared seed. The maze generator do
 - Someone who joins while a maze is under way waits in the lobby and plays from the next maze.
 - If a player leaves the lobby, the others move up (Player 2 becomes Player 1, and so on).
 - If every explorer leaves mid-maze, that maze ends and anyone left goes back to the lobby.
+- Chat is passed on to the other players, and each message also appears in the server's log.
 
 ## Build and run on Linux
 
@@ -21,11 +22,11 @@ sudo dnf install -y gcc-c++ make        # Amazon Linux 2023
 sudo apt install -y g++ make            # Ubuntu / Debian
 ```
 
-Then, from the source bundle (`mazebeasts-server-0.4-src.tar.gz`):
+Then, from the source bundle (`mazebeasts-server-0.41-src.tar.gz`):
 
 ```
-tar xzf mazebeasts-server-0.4-src.tar.gz
-cd mazebeasts-server-0.4
+tar xzf mazebeasts-server-0.41-src.tar.gz
+cd mazebeasts-server-0.41
 make
 ./mazebeasts-server
 ```
@@ -53,6 +54,20 @@ kill $(pidof mazebeasts-server)   # stop it
 
 From the repository (instead of the bundle), run `make` in this `MazeBeastsServer` folder.
 
+### Updating to a new version
+
+The games and the server must be the same version; a game that doesn't match is told so when it tries to join. To update, copy the new bundle to the machine as before, then:
+
+```
+kill $(pidof mazebeasts-server)   # if the old one is running
+tar xzf mazebeasts-server-0.41-src.tar.gz
+cd mazebeasts-server-0.41
+make
+./mazebeasts-server
+```
+
+The compiler is already installed, so there's no `dnf`/`apt` step this time.
+
 ## Running it on AWS EC2
 
 1. **Launch an instance.** In the EC2 console, pick the region nearest to you and the players. Then click **Launch instance**:
@@ -65,7 +80,7 @@ From the repository (instead of the bundle), run `make` in this `MazeBeastsServe
    - Keep the default storage, then **Launch instance**. When it shows *Running*, copy its **Public IPv4 address**.
 2. **Copy the server source up** from PowerShell on your PC (Windows 10 and 11 include `scp` and `ssh`):
    ```
-   scp -i C:\Users\<you>\Downloads\mazebeasts.pem mazebeasts-server-0.4-src.tar.gz ec2-user@<public-ip>:~
+   scp -i C:\Users\<you>\Downloads\mazebeasts.pem mazebeasts-server-0.41-src.tar.gz ec2-user@<public-ip>:~
    ```
    Answer `yes` the first time it asks about the host's fingerprint. If it refuses with *UNPROTECTED PRIVATE KEY FILE*, restrict the key file to your own account, then try again:
    ```
@@ -75,8 +90,8 @@ From the repository (instead of the bundle), run `make` in this `MazeBeastsServe
    ```
    ssh -i C:\Users\<you>\Downloads\mazebeasts.pem ec2-user@<public-ip>
    sudo dnf install -y gcc-c++ make
-   tar xzf mazebeasts-server-0.4-src.tar.gz
-   cd mazebeasts-server-0.4
+   tar xzf mazebeasts-server-0.41-src.tar.gz
+   cd mazebeasts-server-0.41
    make
    ./mazebeasts-server
    ```

@@ -7,6 +7,7 @@
 #include <queue>
 #include <random>
 #include <chrono>
+#include <ctime>
 #include <algorithm>
 #include <tuple>
 #include <cmath>
@@ -223,12 +224,14 @@ struct LaunchOptions {
     int autostart = 0;       // --autostart=N: the host starts the round once N players are in
     double quit_after = 0.0; // --quit-after=SECONDS: close by itself (automated tests)
     bool test = false;       // --test: small unfocused window, mouse left free, sound off
+    int test_w = 640, test_h = 360; // --test-size=WxH: that window's size (to check layouts at real sizes)
     bool test_fire = false;  // --test-fire: shoot every 2 s without input (tests the shot relay)
     bool test_spawn_near = false; // --test-spawn-near[=YAW]: Player 2 starts face to face with Player 1
     double test_spawn_yaw = 180.0; //   (or turned to YAW degrees, to look at the model from other sides)
     bool open_menu = false;  // --open-menu: start with the Esc menu showing
     bool open_sound = false; // --open-menu=sound: ...on its Sound page
     std::string screenshot;  // --screenshot=FILE: save the last frame as a .bmp before quitting
+    std::string test_chat;   // --test-chat=TEXT: once playing, paste TEXT into the chat line and send it
 };
 
 struct Sprite {
@@ -450,11 +453,46 @@ private:
     std::string typed;           // characters typed this frame (from the char callback)
     int backspaces = 0;          // backspace presses this frame, including key repeat
     int left_presses = 0, right_presses = 0; // arrow presses this frame, for the volume slider
+    // More key presses counted by the key callback and used up each frame, so nothing is
+    // missed between frames and holding a key repeats where that makes sense.
+    int enter_presses = 0, y_presses = 0, copy_presses = 0, paste_presses = 0;
+    int up_presses = 0, down_presses = 0, page_up_presses = 0, page_down_presses = 0;
+    int home_presses = 0, end_presses = 0;
+    double wheel = 0.0;          // mouse wheel movement this frame (+ = away from you)
+    std::string note;            // a brief confirmation such as "Copied", shown until note_until
+    double note_until = 0.0;
 
     // Sound option: one master volume for every sound, kept between runs.
     float master_volume = 1.0f;  // slider position, 0..1
     bool volume_dirty = false;   // changed since it was last saved
     bool slider_dragging = false;
+
+    // --- Chat --------------------------------------------------------------------------------
+    // Enter opens a line to type in; Enter again sends it to everyone (in singleplayer it just
+    // shows). The newest 8 messages show along the bottom centre for 15 s each. Y opens a
+    // scrollable log of everything said since the game started. It lives in memory only, so
+    // it's gone when the game closes.
+    static constexpr double CHAT_SHOW_SECONDS = 15.0;
+    static constexpr int    CHAT_ON_SCREEN    = 8;
+    struct ChatMessage {
+        int from;            // sender's slot (1-3), or 0 for you in singleplayer
+        std::string sender;  // "Player 2", "The Beast", "You"
+        std::string text;
+        std::string stamp;   // local time it arrived, "14:05"
+        double shown_until;  // when it leaves the bottom of the screen
+    };
+    std::vector<ChatMessage> chat_history;
+    bool chat_open = false;       // typing a message
+    std::string chat_draft;
+    bool chat_log_open = false;   // the Y window
+    int chat_log_selected = -1;   // message highlighted there (Up/Down), which Ctrl+C copies
+    int chat_log_top = 0;         // first line showing
+    bool chat_log_follow = true;  // keep the newest line in view as messages arrive
+    struct LogLine { int msg; std::string text; };
+    std::vector<LogLine> chat_log_lines;   // the history, wrapped to the window's width
+    std::vector<int> chat_log_first_line;  // per message: its first line in chat_log_lines
+    float chat_log_wrap_w = -1.0f, chat_log_wrap_scale = -1.0f;
+    double test_chat_timer = 1.5; // --test-chat: seconds of play before it sends
 
 public:
     MazeGame(const LaunchOptions& options) : opts(options) {
@@ -743,8 +781,8 @@ public:
         const GLFWvidmode* vid = glfwGetVideoMode(monitor);
         if (opts.windowed || opts.test) {
             // A normal window, so several copies can sit side by side for multiplayer testing.
-            int w = opts.test ? 640 : vid->width / 2 - 24;
-            int h = opts.test ? 360 : w * 9 / 16;
+            int w = opts.test ? opts.test_w : vid->width / 2 - 24;
+            int h = opts.test ? opts.test_h : w * 9 / 16;
             glfwWindowHint(GLFW_DECORATED, GLFW_TRUE);
             glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
             if (opts.test) {
@@ -775,6 +813,7 @@ public:
         glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
         glfwSetCharCallback(window, char_callback);
         glfwSetKeyCallback(window, key_callback);
+        glfwSetScrollCallback(window, scroll_callback);
         glfwSetWindowFocusCallback(window, focus_callback);
         glfwSetInputMode(window, GLFW_CURSOR, opts.test ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED);
     }
@@ -785,13 +824,34 @@ public:
         if (codepoint >= 32 && codepoint < 127) game->typed.push_back(static_cast<char>(codepoint));
     }
 
-    // Backspace and the arrows come through here rather than polling, so holding them repeats.
-    static void key_callback(GLFWwindow* w, int key, int, int action, int) {
+    // Keys for typing and scrolling come through here rather than polling, so nothing is
+    // missed between frames, and the ones that should repeat while held do.
+    static void key_callback(GLFWwindow* w, int key, int, int action, int mods) {
         MazeGame* game = static_cast<MazeGame*>(glfwGetWindowUserPointer(w));
         if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
-        if (key == GLFW_KEY_BACKSPACE) game->backspaces++;
-        else if (key == GLFW_KEY_LEFT) game->left_presses++;
-        else if (key == GLFW_KEY_RIGHT) game->right_presses++;
+        bool press = action == GLFW_PRESS;
+        bool ctrl = (mods & GLFW_MOD_CONTROL) != 0;
+        switch (key) {
+        case GLFW_KEY_BACKSPACE: game->backspaces++; break;
+        case GLFW_KEY_LEFT:      game->left_presses++; break;
+        case GLFW_KEY_RIGHT:     game->right_presses++; break;
+        case GLFW_KEY_UP:        game->up_presses++; break;
+        case GLFW_KEY_DOWN:      game->down_presses++; break;
+        case GLFW_KEY_PAGE_UP:   game->page_up_presses++; break;
+        case GLFW_KEY_PAGE_DOWN: game->page_down_presses++; break;
+        case GLFW_KEY_HOME:      if (press) game->home_presses++; break;
+        case GLFW_KEY_END:       if (press) game->end_presses++; break;
+        case GLFW_KEY_ENTER:
+        case GLFW_KEY_KP_ENTER:  if (press) game->enter_presses++; break;
+        case GLFW_KEY_Y:         if (press && !ctrl) game->y_presses++; break;
+        case GLFW_KEY_C:         if (press && ctrl) game->copy_presses++; break;
+        case GLFW_KEY_V:         if (ctrl) game->paste_presses++; break; // holding Ctrl+V pastes again, as in a text box
+        default: break;
+        }
+    }
+
+    static void scroll_callback(GLFWwindow* w, double, double dy) {
+        static_cast<MazeGame*>(glfwGetWindowUserPointer(w))->wheel += dy;
     }
 
     // Coming back to the window (alt-tab, or clicking between copies) mustn't jerk the view,
@@ -2572,6 +2632,16 @@ public:
         }
 
         if (slot < 0) return; // hasn't said hello yet
+        if (type == MSG_CHAT) {
+            // Shown here, and passed on to everyone else labelled with who said it.
+            std::string text = trim_spaces(clean_chat_text(r.get_text()));
+            if (!r.ok || text.empty()) return;
+            add_chat(slot, text);
+            net::Writer w;
+            w.put<uint8_t>(MSG_CHAT).put<uint8_t>(static_cast<uint8_t>(slot)).put_text(text);
+            net.broadcast(w.buf, true, peer);
+            return;
+        }
         uint8_t rnd = r.get<uint8_t>();
         if (!r.ok || !in_round || rnd != round_id) return; // from a previous maze, or no round yet
 
@@ -2657,6 +2727,12 @@ public:
             my_slot = slot;
             glfwSetWindowTitle(window, ("MazeBeasts - Player " + std::to_string(slot)).c_str());
             log("[net] now player " + std::to_string(slot));
+            return;
+        }
+        case MSG_CHAT: {
+            int from = r.get<uint8_t>();
+            std::string text = trim_spaces(clean_chat_text(r.get_text()));
+            if (r.ok && from >= 1 && from <= 3 && !text.empty()) add_chat(from, text);
             return;
         }
         case MSG_TO_LOBBY: {
@@ -2966,6 +3042,112 @@ public:
     }
 
     // =========================================================================================
+    // Chat
+    // =========================================================================================
+
+    std::string clipboard_text() {
+        const char* s = glfwGetClipboardString(window); // nullptr when the clipboard holds no text
+        return s ? std::string(s) : std::string();
+    }
+
+    void copy_to_clipboard(const std::string& text) {
+        if (text.empty()) return;
+        glfwSetClipboardString(window, text.c_str());
+        flash_note("Copied: " + (text.size() > 40 ? text.substr(0, 37) + "..." : text));
+    }
+
+    // A brief confirmation, shown in place of the hint line wherever you are.
+    void flash_note(const std::string& text) {
+        note = text;
+        note_until = glfwGetTime() + 2.0;
+    }
+
+    bool note_showing() const { return !note.empty() && glfwGetTime() < note_until; }
+
+    std::string chat_sender(int from) const {
+        if (mode == Mode::Single || from < 1 || from > 3) return "You";
+        return capitalised(player_name(from));
+    }
+
+    // Everything said, by anyone, comes through here: into the history (and so the log), and
+    // onto the bottom of the screen for CHAT_SHOW_SECONDS.
+    void add_chat(int from, const std::string& text) {
+        std::time_t t = std::time(nullptr);
+        char stamp[8] = "";
+        if (const std::tm* tm = std::localtime(&t)) std::strftime(stamp, sizeof(stamp), "%H:%M", tm);
+        chat_history.push_back({ from, chat_sender(from), text, stamp, glfwGetTime() + CHAT_SHOW_SECONDS });
+        log("[chat] " + chat_history.back().sender + ": " + text);
+    }
+
+    // Ctrl+V into the chat line: the text made safe for the font, up to the length limit.
+    void chat_paste(const std::string& text) {
+        if (chat_draft.size() < CHAT_MAX_CHARS)
+            chat_draft += clean_chat_text(text, CHAT_MAX_CHARS - chat_draft.size());
+    }
+
+    // Enter on the chat line: send it (unless it's blank) and close the line.
+    void submit_chat() {
+        std::string text = trim_spaces(clean_chat_text(chat_draft));
+        chat_open = false;
+        chat_draft.clear();
+        if (text.empty()) return;
+        add_chat(mode == Mode::Single ? 0 : my_slot, text);
+        net::Writer w;
+        if (mode == Mode::Host) {
+            w.put<uint8_t>(MSG_CHAT).put<uint8_t>(static_cast<uint8_t>(my_slot)).put_text(text);
+            net.broadcast(w.buf, true);
+        }
+        else if (mode == Mode::Client && join_connected) {
+            w.put<uint8_t>(MSG_CHAT).put_text(text);
+            net.send_to_host(w.buf, true);
+        }
+    }
+
+    void copy_selected_chat() {
+        if (chat_log_selected >= 0 && chat_log_selected < static_cast<int>(chat_history.size()))
+            copy_to_clipboard(chat_history[chat_log_selected].text);
+    }
+
+    // Once a frame, before the player's own controls (which the open chat line takes the
+    // keyboard from). The menus handle their own keys; the log's scrolling is handled where
+    // it's drawn, since that's where its size is known.
+    void update_chat(double delta) {
+        if (screen != Screen::None) return;
+        if (!opts.test_chat.empty() && test_chat_timer > 0.0 && (mode == Mode::Single || in_round)) {
+            test_chat_timer -= delta;
+            if (test_chat_timer <= 0.0) {
+                chat_open = true;
+                chat_paste(opts.test_chat); // the path Ctrl+V takes, without touching your clipboard
+                submit_chat();
+            }
+        }
+        if (chat_open) {
+            for (char c : typed) if (chat_draft.size() < CHAT_MAX_CHARS) chat_draft.push_back(c);
+            for (int i = 0; i < backspaces && !chat_draft.empty(); i++) chat_draft.pop_back();
+            for (int i = 0; i < paste_presses; i++) chat_paste(clipboard_text());
+            if (copy_presses) {
+                // Copies what you've typed; with nothing typed, the message picked in the log.
+                if (!chat_draft.empty()) copy_to_clipboard(chat_draft);
+                else if (chat_log_open) copy_selected_chat();
+            }
+            if (enter_presses) submit_chat();
+        }
+        else {
+            // Letters typed while playing (W, A, S, D...) don't carry into a chat line opened
+            // later: only what's typed after Enter counts.
+            if (enter_presses) { chat_open = true; chat_draft.clear(); }
+            else if (y_presses) {
+                chat_log_open = !chat_log_open;
+                if (chat_log_open) {
+                    chat_log_selected = static_cast<int>(chat_history.size()) - 1; // the newest
+                    chat_log_follow = true;
+                }
+            }
+            if (copy_presses && chat_log_open) copy_selected_chat();
+        }
+    }
+
+    // =========================================================================================
     // Menu
     // =========================================================================================
 
@@ -2994,6 +3176,10 @@ public:
         down_prev = glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS;
         typed.clear();
         backspaces = 0;
+        // A menu takes over the keyboard: an unsent chat line is dropped and the log closes.
+        chat_open = false;
+        chat_draft.clear();
+        chat_log_open = false;
     }
 
     void close_menu() {
@@ -3005,7 +3191,11 @@ public:
     void handle_escape() {
         bool down = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
         if (down && !esc_pressed) {
-            switch (screen) {
+            // In the game, Esc first backs out of the chat line, then the chat log, and only
+            // then opens the menu.
+            if (screen == Screen::None && chat_open) { chat_open = false; chat_draft.clear(); }
+            else if (screen == Screen::None && chat_log_open) chat_log_open = false;
+            else switch (screen) {
             case Screen::None: open_menu(Screen::Main); break;
             case Screen::Main: close_menu(); break;
             case Screen::Host: menu_action(MenuAction::CancelHost); break;
@@ -3152,18 +3342,34 @@ public:
                  (lobby_mask & (1 << 3)) ? player_color(3) : dim);
             buttons = { { "Start the game", MenuAction::StartGame, (lobby_mask & (1 << 2)) != 0 },
                         { "Cancel", MenuAction::CancelHost, true } };
-            hint = "Esc: stop hosting";
+            // Ctrl+C puts the address to share on the clipboard, ready to paste to the others.
+            if (copy_presses && !host_ips.empty()) copy_to_clipboard(host_ips.front());
+            hint = host_ips.empty() ? "Esc: stop hosting" : "Esc: stop hosting   Ctrl+C: copy your IP address";
         }
         else if (screen == Screen::Join) {
             editable = !join_connecting && !join_connected;
             if (editable) {
-                for (char c : typed) {
-                    bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-                           || c == '.' || c == '-' || c == ':';
-                    if (ok && join_address.size() < 64) join_address.push_back(c);
+                // Only what can be part of an address gets in, typed or pasted, so a pasted
+                // line's spaces or line break are simply left out.
+                auto address_chars = [](const std::string& in) {
+                    std::string out;
+                    for (char c : in) {
+                        bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                               || c == '.' || c == '-' || c == ':';
+                        if (ok) out.push_back(c);
+                    }
+                    return out;
+                };
+                // Ctrl+V replaces the whole address: a pasted address is nearly always complete,
+                // and there's no selecting text in this box to paste over.
+                if (paste_presses) {
+                    std::string pasted = address_chars(clipboard_text());
+                    if (!pasted.empty()) join_address = pasted.substr(0, 64);
                 }
+                join_address += address_chars(typed).substr(0, 64 - std::min<size_t>(64, join_address.size()));
                 for (int i = 0; i < backspaces && !join_address.empty(); i++) join_address.pop_back();
             }
+            if (copy_presses && !join_address.empty()) copy_to_clipboard(join_address);
             text("Host or server IP address:", bright);
             items.push_back({ INPUT, join_address, bright, 0.9f, 60.0f });
             text("UDP port " + port + ", or type address:port for another", dim);
@@ -3189,10 +3395,11 @@ public:
             else
                 buttons = { { "Connect", MenuAction::Connect, editable && !join_address.empty() },
                             { "Back", MenuAction::BackFromJoin, true } };
-            hint = editable ? "Type the host's or server's IP address, then press Enter" : "Esc: leave";
+            hint = editable ? "Type the host's or server's IP address (or paste it: Ctrl+V), then press Enter" : "Esc: leave";
         }
         if (!menu_status.empty()) text(menu_status, menu_status_error ? bad : dim);
         gap(10.0f);
+        if (note_showing()) hint = note; // "Copied: ..." for a moment
 
         // A first button that becomes available (Start, once someone joins) takes the focus,
         // so Enter starts the game instead of hitting the Cancel or Leave it was parked on.
@@ -3276,7 +3483,9 @@ public:
             y += bh + button_gap * ui;
         }
         if (!hint.empty()) draw_text_centered(hint, cx, y + 22.0f * ui, dim, 0.6f * ui);
-        draw_text("v0.4", W - 52.0f * std::max(ui, 0.6f), H - 10.0f, { 0.45f, 0.45f, 0.52f, 1.0f }, 0.55f * std::max(ui, 0.6f));
+        const std::string version = "v0.41";
+        const float vs = 0.55f * std::max(ui, 0.6f);
+        draw_text(version, W - text_width(version, vs) - 12.0f, H - 10.0f, { 0.45f, 0.45f, 0.52f, 1.0f }, vs);
         glEnable(GL_DEPTH_TEST);
 
         // ---- Input, after drawing: an action may switch screens ---------------------------------
@@ -3383,6 +3592,247 @@ public:
         glEnable(GL_DEPTH_TEST);
     }
 
+    // ---- Chat on screen ----------------------------------------------------------------------
+
+    float chat_scale() const { return std::clamp(screen_height / 1150.0f, 0.46f, 0.8f); }
+
+    // The chat column is centred and, on a wide enough window, clear of the health bar on the
+    // left.
+    float chat_column_width() const {
+        float W = static_cast<float>(screen_width);
+        float w = std::min(W * 0.56f, W - 760.0f);
+        return std::max(w, std::min(W - 24.0f, 320.0f));
+    }
+
+    // Splits text into lines no wider than max_w, breaking at spaces where it can and inside a
+    // word only when one word alone is too long.
+    std::vector<std::string> wrap_text(const std::string& text, float scale, float max_w) const {
+        std::vector<std::string> lines;
+        std::string line;
+        float width = 0.0f;
+        size_t space = std::string::npos; // the last space in `line`
+        for (char c : text) {
+            if (c < 32 || c > 126) continue;
+            float cw = cdata[c - 32].xadvance * scale;
+            if (width + cw > max_w && !line.empty()) {
+                if (c == ' ') { // break right here, dropping the space
+                    lines.push_back(line);
+                    line.clear();
+                    width = 0.0f;
+                    space = std::string::npos;
+                    continue;
+                }
+                std::string rest;
+                if (space != std::string::npos) {
+                    rest = line.substr(space + 1);
+                    line.resize(space);
+                }
+                lines.push_back(line);
+                line = rest;
+                width = text_width(line, scale);
+                space = std::string::npos;
+            }
+            if (c == ' ' && line.empty() && !lines.empty()) continue; // no space at the start of a wrapped line
+            line.push_back(c);
+            width += cw;
+            if (c == ' ') space = line.size() - 1;
+        }
+        if (!line.empty() || lines.empty()) lines.push_back(line);
+        return lines;
+    }
+
+    // Draws a line whose start is in other colours: each part is (character count, colour),
+    // and whatever follows them is drawn in `rest`.
+    void draw_segments(const std::string& line, float x, float y, float scale,
+                       std::initializer_list<std::pair<size_t, glm::vec4>> parts, glm::vec4 rest) {
+        size_t pos = 0;
+        for (const auto& part : parts) {
+            if (pos >= line.size()) return;
+            std::string piece = line.substr(pos, part.first);
+            draw_text(piece, x, y, part.second, scale);
+            x += text_width(piece, scale);
+            pos += piece.size();
+        }
+        if (pos < line.size()) draw_text(line.substr(pos), x, y, rest, scale);
+    }
+
+    static glm::vec4 faded(glm::vec4 c, float alpha) { return { c.r, c.g, c.b, c.a * alpha }; }
+
+    // The chat along the bottom centre (the line being typed, with recent messages stacked
+    // above it), plus the Y log window when it's open.
+    void render_chat() {
+        if (screen != Screen::None) return;
+        const double now = glfwGetTime();
+        bool recent_any = !chat_history.empty() && chat_history.back().shown_until > now;
+        if (!chat_open && !chat_log_open && !recent_any) return;
+
+        glViewport(0, 0, screen_width, screen_height);
+        glm::mat4 projection = glm::ortho(0.0f, static_cast<float>(screen_width), static_cast<float>(screen_height), 0.0f, -1.0f, 1.0f);
+        glm::mat4 id = glm::mat4(1.0f);
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "view"), 1, GL_FALSE, glm::value_ptr(id));
+        glUniformMatrix4fv(glGetUniformLocation(shader_program, "model"), 1, GL_FALSE, glm::value_ptr(id));
+        glDisable(GL_DEPTH_TEST);
+
+        const float W = static_cast<float>(screen_width), H = static_cast<float>(screen_height);
+        const float s = chat_scale(), line_h = 38.0f * s, pad = 8.0f * s, ascent = 30.0f * s;
+        const float col_w = chat_column_width(), cx = W * 0.5f;
+        const glm::vec4 white = { 1.0f, 1.0f, 1.0f, 1.0f }, dim = { 0.72f, 0.76f, 0.84f, 1.0f };
+        const glm::vec4 gold = { 0.95f, 0.78f, 0.30f, 1.0f }, red = { 1.0f, 0.45f, 0.40f, 1.0f };
+        const float bottom = H - 14.0f;
+
+        // The line being typed: a box along the bottom that grows upward as the text wraps.
+        // Its space is kept even while it's closed, so messages don't jump when it opens.
+        float input_h = line_h + 2.0f * pad;
+        if (chat_open) {
+            bool caret = std::fmod(now, 1.0) < 0.5;
+            auto lines = wrap_text("Say: " + chat_draft + (caret ? "_" : " "), s, col_w - 2.0f * pad);
+            input_h = lines.size() * line_h + 2.0f * pad;
+            float top = bottom - input_h, left = cx - col_w * 0.5f, right = cx + col_w * 0.5f;
+            draw_quad(left - 2.0f, top - 2.0f, right + 2.0f, bottom + 2.0f, gold);
+            draw_quad(left, top, right, bottom, { 0.05f, 0.06f, 0.09f, 0.92f });
+            for (size_t i = 0; i < lines.size(); i++) {
+                float y = top + pad + line_h * i + ascent;
+                if (i == 0) draw_segments(lines[i], left + pad, y, s, { { 5, gold } }, white);
+                else draw_text(lines[i], left + pad, y, white, s);
+            }
+            // Just above the box: how to finish, and how much room is left.
+            const float hs = s * 0.8f;
+            std::string hint = note_showing() ? note : "Enter: send   Esc: cancel   Ctrl+V: paste   Ctrl+C: copy";
+            std::string count = std::to_string(chat_draft.size()) + "/" + std::to_string(CHAT_MAX_CHARS);
+            draw_text(hint, left, top - 7.0f * s, dim, hs);
+            draw_text(count, right - text_width(count, hs), top - 7.0f * s, chat_draft.size() >= CHAT_MAX_CHARS ? red : dim, hs);
+            input_h += 26.0f * s; // and room for that line
+        }
+
+        // Recent messages, newest at the bottom: the last CHAT_ON_SCREEN that are still within
+        // their CHAT_SHOW_SECONDS, each fading out over its final second. A ninth pushes the
+        // oldest off the top. They stop short of the middle of the screen.
+        std::vector<int> recent;
+        for (int i = static_cast<int>(chat_history.size()) - 1; i >= 0 && static_cast<int>(recent.size()) < CHAT_ON_SCREEN; i--) {
+            if (chat_history[i].shown_until <= now) break; // anything older has gone as well
+            recent.push_back(i);
+        }
+        float y = bottom - input_h - 6.0f * s; // bottom edge of the next line to draw, going up
+        const float top_limit = H * 0.42f;
+        bool full = false;
+        for (int idx : recent) {
+            const ChatMessage& m = chat_history[idx];
+            float alpha = static_cast<float>(std::clamp(m.shown_until - now, 0.0, 1.0));
+            auto lines = wrap_text(m.sender + ": " + m.text, s, col_w - 2.0f * pad);
+            for (int li = static_cast<int>(lines.size()) - 1; li >= 0; li--) {
+                if (y - line_h < top_limit) { full = true; break; }
+                float w = text_width(lines[li], s), left = cx - w * 0.5f;
+                draw_quad(left - pad, y - line_h, left + w + pad, y, { 0.0f, 0.0f, 0.0f, 0.55f * alpha });
+                float base = y - line_h + ascent + 2.0f * s;
+                if (li == 0) draw_segments(lines[li], left, base, s, { { m.sender.size() + 1, faded(player_color_of_sender(m), alpha) } }, faded(white, alpha));
+                else draw_text(lines[li], left, base, faded(white, alpha), s);
+                y -= line_h;
+            }
+            if (full) break;
+            y -= 3.0f * s; // a little space between messages
+        }
+
+        if (chat_log_open) render_chat_log();
+        glEnable(GL_DEPTH_TEST);
+    }
+
+    glm::vec4 player_color_of_sender(const ChatMessage& m) const {
+        return m.from >= 1 && m.from <= 3 && mode != Mode::Single ? player_color(m.from) : glm::vec4(0.40f, 1.00f, 0.50f, 1.0f);
+    }
+
+    // The Y window: everything said since the game started, newest at the bottom. Up/Down
+    // pick a message (Ctrl+C copies it); the wheel, Page Up/Down, Home and End scroll.
+    void render_chat_log() {
+        const float W = static_cast<float>(screen_width), H = static_cast<float>(screen_height);
+        const float s = chat_scale() * 0.92f, line_h = 36.0f * s, ascent = 28.0f * s;
+        const float pad = 10.0f * s, title_h = 42.0f * s, hint_h = 32.0f * s, bar_w = 7.0f * s;
+        const glm::vec4 white = { 1.0f, 1.0f, 1.0f, 1.0f }, dim = { 0.66f, 0.70f, 0.78f, 1.0f };
+        const glm::vec4 gold = { 0.95f, 0.78f, 0.30f, 1.0f };
+
+        const float pw = std::clamp(W * 0.5f, std::min(W - 20.0f, 380.0f), 900.0f);
+        const float ph = std::clamp(H * 0.48f, std::min(H - 20.0f, 220.0f), 640.0f);
+        const float px = (W - pw) * 0.5f;
+        const float py = std::clamp(std::max(H * 0.1f, 50.0f), 10.0f, std::max(10.0f, H - 10.0f - ph)); // below the objective line
+        draw_quad(px - 2.0f, py - 2.0f, px + pw + 2.0f, py + ph + 2.0f, { 0.95f, 0.78f, 0.30f, 0.85f });
+        draw_quad(px, py, px + pw, py + ph, { 0.04f, 0.05f, 0.08f, 0.92f });
+
+        const int n = static_cast<int>(chat_history.size());
+        draw_text("Chat log (" + std::to_string(n) + (n == 1 ? " message)" : " messages)"), px + pad, py + title_h * 0.7f, gold, s * 1.05f);
+
+        // Wrap the history to this width (again only if the window changed size; otherwise
+        // just the messages that are new since last time).
+        const float x0 = px + pad, text_w = pw - 3.0f * pad - bar_w;
+        const float y0 = py + title_h, y1 = py + ph - hint_h;
+        if (text_w != chat_log_wrap_w || s != chat_log_wrap_scale) {
+            chat_log_lines.clear();
+            chat_log_first_line.clear();
+            chat_log_wrap_w = text_w;
+            chat_log_wrap_scale = s;
+        }
+        for (size_t mi = chat_log_first_line.size(); mi < chat_history.size(); mi++) {
+            const ChatMessage& m = chat_history[mi];
+            chat_log_first_line.push_back(static_cast<int>(chat_log_lines.size()));
+            for (auto& l : wrap_text("[" + m.stamp + "] " + m.sender + ": " + m.text, s, text_w))
+                chat_log_lines.push_back({ static_cast<int>(mi), l });
+        }
+
+        // Keys and wheel.
+        const int total = static_cast<int>(chat_log_lines.size());
+        const int visible = std::max(1, static_cast<int>((y1 - y0) / line_h));
+        const int max_top = std::max(0, total - visible);
+        bool scrolled = false;
+        int scroll = -static_cast<int>(std::lround(wheel * 3.0));
+        scroll += (page_down_presses - page_up_presses) * std::max(1, visible - 1);
+        if (scroll != 0) { chat_log_top += scroll; scrolled = true; }
+        if (home_presses) { chat_log_top = 0; scrolled = true; }
+        if (end_presses) { chat_log_top = max_top; scrolled = true; }
+        if (n > 0 && (up_presses || down_presses)) {
+            int sel = chat_log_selected < 0 || chat_log_selected >= n ? n - 1 : chat_log_selected;
+            chat_log_selected = std::clamp(sel - up_presses + down_presses, 0, n - 1);
+            // Bring the picked message into view.
+            int first = chat_log_first_line[chat_log_selected];
+            int last = (chat_log_selected + 1 < n ? chat_log_first_line[chat_log_selected + 1] : total) - 1;
+            if (first < chat_log_top) chat_log_top = first;
+            if (last >= chat_log_top + visible) chat_log_top = last - visible + 1;
+            scrolled = true;
+        }
+        if (scrolled) chat_log_follow = chat_log_top >= max_top;
+        if (chat_log_follow) chat_log_top = max_top;
+        chat_log_top = std::clamp(chat_log_top, 0, max_top);
+
+        if (n == 0) {
+            draw_text_centered("Nothing has been said yet. Press Enter to chat.", px + pw * 0.5f, (y0 + y1) * 0.5f, dim, s);
+        }
+        for (int i = chat_log_top; i < std::min(total, chat_log_top + visible); i++) {
+            const LogLine& l = chat_log_lines[i];
+            const ChatMessage& m = chat_history[l.msg];
+            float top = y0 + (i - chat_log_top) * line_h;
+            if (l.msg == chat_log_selected)
+                draw_quad(px + 4.0f, top, px + pw - 2.0f * pad - bar_w, top + line_h, { 0.22f, 0.25f, 0.34f, 0.95f });
+            float base = top + ascent;
+            if (chat_log_first_line[l.msg] == i)
+                draw_segments(l.text, x0, base, s, { { m.stamp.size() + 3, dim }, { m.sender.size() + 1, player_color_of_sender(m) } }, white);
+            else
+                draw_text(l.text, x0, base, white, s);
+        }
+
+        // Scrollbar, when there's more than fits.
+        if (total > visible) {
+            float bx = px + pw - pad - bar_w;
+            draw_quad(bx, y0, bx + bar_w, y1, { 0.18f, 0.20f, 0.26f, 1.0f });
+            float thumb = std::max(18.0f * s, (y1 - y0) * visible / total);
+            float t = max_top > 0 ? static_cast<float>(chat_log_top) / max_top : 1.0f;
+            float ty = y0 + (y1 - y0 - thumb) * t;
+            draw_quad(bx, ty, bx + bar_w, ty + thumb, gold);
+        }
+
+        std::string hint = note_showing() ? note : "Up/Down: pick   Ctrl+C: copy   Wheel, PgUp/PgDn: scroll   Y: close";
+        float hs = s * 0.85f;
+        hs = std::min(hs, (pw - 2.0f * pad) / std::max(1.0f, text_width(hint, 1.0f)));
+        draw_text(hint, px + pad, py + ph - hint_h * 0.32f, note_showing() ? gold : dim, hs);
+    }
+
     void run() {
         last_time = glfwGetTime();
         const double launch_time = last_time;
@@ -3399,6 +3849,7 @@ public:
 
             handle_escape();
             pump_network();
+            update_chat(delta);
             if (mode == Mode::Host && !in_round && opts.autostart > 0 && (lobby_mask & (1 << 2))
                 && player_count() >= opts.autostart)
                 host_start_round();
@@ -3542,11 +3993,17 @@ public:
             render_hud(hud_bosses);
             render_labels();
             render_center_message(hud_bosses);
+            render_chat();
             if (screen != Screen::None) render_menu();
 
+            // This frame's key presses have all been used (or ignored) by now.
             typed.clear();
             backspaces = 0;
             left_presses = right_presses = 0;
+            enter_presses = y_presses = copy_presses = paste_presses = 0;
+            up_presses = down_presses = page_up_presses = page_down_presses = 0;
+            home_presses = end_presses = 0;
+            wheel = 0.0;
             if (net.active()) net.flush();
 
             if (!opts.screenshot.empty() && glfwWindowShouldClose(window)) save_screenshot(opts.screenshot);
@@ -3558,13 +4015,16 @@ public:
     void process_input(double delta, double& last_mouse_x, double& last_mouse_y) {
         // Esc is handled in the main loop: it opens the menu. With a menu open (only possible
         // here during a multiplayer round) the player just stands still; physics carries on.
+        // While a chat line is open the keyboard types into it, so the game's keys do nothing,
+        // though the mouse still looks around.
         bool controls = screen == Screen::None;
-        bool can_move = controls && !spectating;
+        bool keys = controls && !chat_open;
+        bool can_move = keys && !spectating;
 
         // F8 makes a new maze: in singleplayer straight away; in multiplayer only the host (or
         // Player 1, on a dedicated server) can, and it starts a new round for everyone. One maze
         // per press, not one per frame held.
-        bool f8_down = controls && glfwGetKey(window, GLFW_KEY_F8) == GLFW_PRESS;
+        bool f8_down = keys && glfwGetKey(window, GLFW_KEY_F8) == GLFW_PRESS;
         if (f8_down && !f8_pressed) {
             if (mode == Mode::Single) regenerate_maze();
             else if (mode == Mode::Host) host_start_round();
@@ -3577,13 +4037,13 @@ public:
         f8_pressed = f8_down;
 
         // Tab toggles the map view (press to switch, no longer hold-to-view).
-        bool tab_down = controls && glfwGetKey(window, GLFW_KEY_TAB) == GLFW_PRESS;
+        bool tab_down = keys && glfwGetKey(window, GLFW_KEY_TAB) == GLFW_PRESS;
         if (tab_down && !tab_pressed) tab_view = !tab_view;
         tab_pressed = tab_down;
 
         // F5 toggles developer mode; F6 teleports through boss rooms while it is enabled.
         // Singleplayer only - teleporting around a shared maze would just be cheating.
-        bool dev_keys = controls && mode == Mode::Single;
+        bool dev_keys = keys && mode == Mode::Single;
         bool f5_down = dev_keys && glfwGetKey(window, GLFW_KEY_F5) == GLFW_PRESS;
         if (f5_down && !f5_pressed) dev_mode = !dev_mode;
         f5_pressed = f5_down;
@@ -3600,7 +4060,7 @@ public:
         if (is_beast()) move_speed *= BEAST_SPEED;
 
         if (free_fly) {
-            if (controls) fly(move_speed * 1.5);
+            if (keys) fly(move_speed * 1.5);
         }
         else {
             if (!can_move) move_speed = 0.0;
@@ -4211,6 +4671,14 @@ static LaunchOptions parse_args(int argc, char** argv) {
         else if (a.rfind("--autostart", 0) == 0) o.autostart = std::atoi(value("--autostart").c_str());
         else if (a.rfind("--quit-after", 0) == 0) o.quit_after = std::atof(value("--quit-after").c_str());
         else if (a == "--test") o.test = true;
+        else if (a.rfind("--test-size", 0) == 0) {
+            std::string v = value("--test-size");
+            size_t x = v.find('x');
+            if (x != std::string::npos) {
+                o.test_w = std::clamp(std::atoi(v.c_str()), 320, 3840);
+                o.test_h = std::clamp(std::atoi(v.c_str() + x + 1), 200, 2160);
+            }
+        }
         else if (a == "--test-fire") o.test_fire = true;
         else if (a.rfind("--test-spawn-near", 0) == 0) {
             o.test_spawn_near = true;
@@ -4219,6 +4687,7 @@ static LaunchOptions parse_args(int argc, char** argv) {
         else if (a == "--open-menu") o.open_menu = true;
         else if (a == "--open-menu=sound") { o.open_menu = true; o.open_sound = true; }
         else if (a.rfind("--screenshot", 0) == 0) o.screenshot = value("--screenshot");
+        else if (a.rfind("--test-chat", 0) == 0) o.test_chat = value("--test-chat");
         else std::cerr << "Unknown option: " << a << std::endl;
     }
     return o;
