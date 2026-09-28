@@ -56,7 +56,7 @@ From the repository (instead of the bundle), run `make` in this `MazeBeastsServe
 
 ### Updating to a new version
 
-The games and the server must be the same version; a game that doesn't match is told so when it tries to join. To update, copy the new bundle to the machine as before, then:
+The games and the server must be the same version; a game that doesn't match is told so when it tries to join. To update, copy the new bundle to the server machine, then:
 
 ```
 kill $(pidof mazebeasts-server)   # if the old one is running
@@ -68,37 +68,7 @@ make
 
 The compiler is already installed, so there's no `dnf`/`apt` step this time.
 
-## Running it on AWS EC2
-
-1. **Launch an instance.** In the EC2 console, pick the region nearest to you and the players. Then click **Launch instance**:
-   - **AMI:** Amazon Linux 2023, 64-bit (x86).
-   - **Instance type:** `t3.micro` (or `t2.micro` if that's the free-tier choice in your region).
-   - **Key pair:** create one (RSA, `.pem`) and save the file, for example as `C:\Users\<you>\Downloads\mazebeasts.pem`.
-   - **Network settings → Edit → Create security group** with two inbound rules:
-     - `SSH`, TCP 22, source **My IP**
-     - `Custom UDP`, port **29180**, source **Anywhere-IPv4** (`0.0.0.0/0`), or only the players' IP addresses
-   - Keep the default storage, then **Launch instance**. When it shows *Running*, copy its **Public IPv4 address**.
-2. **Copy the server source up** from PowerShell on your PC (Windows 10 and 11 include `scp` and `ssh`):
-   ```
-   scp -i C:\Users\<you>\Downloads\mazebeasts.pem mazebeasts-server-0.42-src.tar.gz ec2-user@<public-ip>:~
-   ```
-   Answer `yes` the first time it asks about the host's fingerprint. If it refuses with *UNPROTECTED PRIVATE KEY FILE*, restrict the key file to your own account, then try again:
-   ```
-   icacls C:\Users\<you>\Downloads\mazebeasts.pem /inheritance:r /grant:r "$($env:USERNAME):(R)"
-   ```
-3. **Build and start it:**
-   ```
-   ssh -i C:\Users\<you>\Downloads\mazebeasts.pem ec2-user@<public-ip>
-   sudo dnf install -y gcc-c++ make
-   tar xzf mazebeasts-server-0.42-src.tar.gz
-   cd mazebeasts-server-0.42
-   make
-   ./mazebeasts-server
-   ```
-4. **Play:** in each game, choose **Esc → Multiplayer - Join**, type the instance's public IP address, and click **Connect**. When everyone is in, Player 1 clicks **Start the game**.
-5. **When you're done**, stop the server with Ctrl+C. Then in the EC2 console choose **Instance state → Stop** (you can start it again later) or **Terminate** (deletes it). A stopped instance gets a new public IP address when started again, unless you attach an Elastic IP.
-
-If a game says *Could not reach ...*, check that the server is running, that the IP address is the instance's **public** one, and that the security group has the UDP 29180 rule.
+If a game says *Could not reach ...*, check that the server is running, that you typed the server's public IP address, and that UDP port 29180 is allowed through any firewall in between.
 
 ## Windows
 
