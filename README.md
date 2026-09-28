@@ -42,7 +42,7 @@ Press **Enter**, type, and press **Enter** again to send (**Esc** cancels). Mess
 
 ## Multiplayer
 
-Press **Esc** for the menu: **Singleplayer**, **Multiplayer - Join**, **Multiplayer - Host**, **Sound** and **Exit**.
+Press **Esc** for the menu: **Singleplayer**, **Multiplayer - Join**, **Multiplayer - Host**, **Sound**, **Controls** and **Exit**.
 
 - **Hosting:** choose *Multiplayer - Host*. The lobby shows your IP address and a maze seed, and says *Waiting for players*. Once a second player joins it shows *2/3 players joined* and you can click **Start the game**.
 - **Joining:** choose *Multiplayer - Join*, type the host's (or dedicated server's) IP address and press **Connect**. The game uses **UDP port 29180**; to reach a different port, type `address:port`.
@@ -67,7 +67,7 @@ Press **Esc** for the menu: **Singleplayer**, **Multiplayer - Join**, **Multipla
 - The host may see a Windows Firewall prompt the first time they host. Allow it on private networks for LAN play.
 - Over the internet, the host must forward UDP port 29180 on their router.
 
-**Trying it on one PC:** run `Test multiplayer on this PC.bat` from the release folder. It opens two windowed copies side by side, and you connect one to the other with `127.0.0.1`. You can also start copies yourself with `MazeBeasts.exe --windowed=left` and `--windowed=right`.
+**Trying it on one PC:** from a command prompt in the game's folder, start two copies side by side with `MazeBeasts.exe --windowed=left` and `MazeBeasts.exe --windowed=right`. Host in one, and join `127.0.0.1` from the other.
 
 ## Dedicated server
 
@@ -75,7 +75,8 @@ Instead of one player hosting, everyone can join a **dedicated server**: a separ
 
 - Players join it with *Multiplayer - Join* and its IP address. The first to join is Player 1 and starts the game from the lobby. After that, a new maze takes a vote (**F8** or `votemap`).
 - Someone who joins while a maze is under way plays from the next maze.
-- `Test with a dedicated server.bat` opens two game windows and connects both to a server you name. `Test dedicated server on this PC.bat` runs the Windows build of the server (`MazeBeastsServer.exe`) with two games joined to it.
+- The release includes `MazeBeastsServer.exe`, the server for Windows (for a LAN, or to try it on one PC), and `mazebeasts-server-<version>-src.tar.gz`, its source for building on Linux.
+- To try it on one PC, run `MazeBeastsServer.exe`, then start two games that join it: `MazeBeasts.exe --windowed=left --join=127.0.0.1` and `MazeBeasts.exe --windowed=right --join=127.0.0.1`. Games and server must be the same version.
 
 See [MazeBeastsServer/README.md](MazeBeastsServer/README.md) to build it on Linux and set it up on EC2.
 
@@ -85,7 +86,7 @@ This is better than my original [Python version](https://github.com/aigles1/pyMa
 
 ## Download and play
 
-Download the latest release zip from the [Releases](../../releases) page and unzip it. Keep `MazeBeasts.exe` and `assets.dat` in the same folder, then run `MazeBeasts.exe`.
+Download the latest release zip from the [Releases](../../releases) page and unzip it. Keep `MazeBeasts.exe` and `assets.dat` in the same folder, then run `MazeBeasts.exe`. (`MazeBeastsServer.exe` is only needed to run a dedicated server.)
 
 Tested on Windows 11. No Visual C++ Redistributable or other installs are needed.
 
