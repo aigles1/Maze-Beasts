@@ -44,9 +44,12 @@ To keep it running after you log out:
 
 ```
 nohup ./mazebeasts-server > server.log 2>&1 &
-tail -f server.log          # watch it (Ctrl+C stops watching, not the server)
-pkill mazebeasts-server     # stop it
+tail -f server.log                # watch it (Ctrl+C stops watching, not the server)
+pidof mazebeasts-server           # is it running? prints its process number, or nothing
+kill $(pidof mazebeasts-server)   # stop it
 ```
+
+(`pkill mazebeasts-server` doesn't work: Linux shortens process names to 15 characters.)
 
 From the repository (instead of the bundle), run `make` in this `MazeBeastsServer` folder.
 
