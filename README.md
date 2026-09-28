@@ -42,7 +42,8 @@ When run from Visual Studio, the game falls back to the loose asset files in the
 
 ## Future plans
 
-I might get rid of the projectiles in the future and just show damage on the walls and monsters. I'll update this when I have more ideas.
+I might get rid of the projectiles in the future and just show damage on the walls and monsters.
+Update: 9/28 I have a working multiplayer version, will upload soon
 
 ## License
 
